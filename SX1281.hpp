@@ -523,7 +523,7 @@ class SX1281 : public LibXR::Application
     ASSERT(active_tx_packet_ == nullptr);
 
     Packet* packet = nullptr;
-    if (tx_queue_.Pop(packet, 0) != LibXR::ErrorCode::OK)
+    if (tx_queue_.Pop(packet) != LibXR::ErrorCode::OK)
     {
       return false;
     }
