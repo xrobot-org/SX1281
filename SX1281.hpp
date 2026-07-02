@@ -28,7 +28,7 @@ depends: []
 
 #include "app_framework.hpp"
 #include "gpio.hpp"
-#include "queue.hpp"
+#include "mpmc_queue.hpp"
 #include "semaphore.hpp"
 #include "spi.hpp"
 #include "thread.hpp"
@@ -124,8 +124,9 @@ class SX1281 : public LibXR::Application
 
   Packet* AllocatePacket(uint32_t timeout_ms = 0)
   {
+    UNUSED(timeout_ms);
     Packet* packet = nullptr;
-    if (free_queue_.Pop(packet, timeout_ms) != LibXR::ErrorCode::OK)
+    if (free_queue_.Pop(packet) != LibXR::ErrorCode::OK)
     {
       return nullptr;
     }
@@ -171,8 +172,9 @@ class SX1281 : public LibXR::Application
   // The caller owns the returned packet and must Release() it after processing.
   Packet* Receive(uint32_t timeout_ms = 0)
   {
+    UNUSED(timeout_ms);
     Packet* packet = nullptr;
-    if (rx_queue_.Pop(packet, timeout_ms) != LibXR::ErrorCode::OK)
+    if (rx_queue_.Pop(packet) != LibXR::ErrorCode::OK)
     {
       return nullptr;
     }
@@ -990,9 +992,9 @@ class SX1281 : public LibXR::Application
   LibXR::SPI::OperationRW spi_op_;
   Packet packet_pool_[PACKET_POOL_CAPACITY] = {};
   PacketOwner packet_owner_[PACKET_POOL_CAPACITY] = {};
-  LibXR::LockQueue<Packet*> free_queue_;
-  LibXR::LockQueue<Packet*> tx_queue_;
-  LibXR::LockQueue<Packet*> rx_queue_;
+  LibXR::MPMCQueue<Packet*> free_queue_;
+  LibXR::MPMCQueue<Packet*> tx_queue_;
+  LibXR::MPMCQueue<Packet*> rx_queue_;
   LibXR::Thread irq_thread_;
   Config config_;
 
