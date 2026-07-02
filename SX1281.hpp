@@ -28,7 +28,7 @@ depends: []
 
 #include "app_framework.hpp"
 #include "gpio.hpp"
-#include "lock_queue.hpp"
+#include "queue.hpp"
 #include "semaphore.hpp"
 #include "spi.hpp"
 #include "thread.hpp"
