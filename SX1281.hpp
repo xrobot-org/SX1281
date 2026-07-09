@@ -2,7 +2,7 @@
 
 // clang-format off
 /* === MODULE MANIFEST V2 ===
-module_description: SEMTECH SX1281/SX1280 2.4 GHz LoRa transceiver driver module
+module_description: XRobot Module for Semtech SX1281/SX1280 2.4 GHz LoRa transceiver
 constructor_args:
   - config:
       frequency_hz: 2404000000
@@ -16,7 +16,7 @@ constructor_args:
       tx_queue_length: 4
       rx_queue_length: 4
 template_args: []
-required_hardware: spi_sx1281/spi1/SPI1 sx1281_nss/sx1281_cs dio1 dio2 dio3 paen lnaen dcdcen busy nreset
+required_hardware: sx1281_spi sx1281_nss sx1281_dio1 sx1281_dio2 sx1281_dio3 sx1281_paen sx1281_lnaen sx1281_dcdcen sx1281_busy sx1281_nreset
 depends: []
 === END MANIFEST === */
 // clang-format on
@@ -61,16 +61,16 @@ class SX1281 : public LibXR::Application
   };
 
   SX1281(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app, Config config)
-      : spi_(hw.template FindOrExit<LibXR::SPI>({"spi_sx1281", "spi1", "SPI1"})),
-        nss_(hw.template FindOrExit<LibXR::GPIO>({"sx1281_nss", "sx1281_cs"})),
-        dio1_(hw.template FindOrExit<LibXR::GPIO>({"dio1", "sx1281_dio1"})),
-        dio2_(hw.template FindOrExit<LibXR::GPIO>({"dio2", "sx1281_dio2"})),
-        dio3_(hw.template FindOrExit<LibXR::GPIO>({"dio3", "sx1281_dio3"})),
-        paen_(hw.template FindOrExit<LibXR::GPIO>({"paen", "sx1281_paen"})),
-        lnaen_(hw.template FindOrExit<LibXR::GPIO>({"lnaen", "sx1281_lnaen"})),
-        dcdcen_(hw.template FindOrExit<LibXR::GPIO>({"dcdcen", "sx1281_dcdcen"})),
-        busy_(hw.template FindOrExit<LibXR::GPIO>({"busy", "sx1281_busy"})),
-        nreset_(hw.template FindOrExit<LibXR::GPIO>({"nreset", "sx1281_nreset"})),
+      : spi_(hw.template FindOrExit<LibXR::SPI>({"sx1281_spi"})),
+        nss_(hw.template FindOrExit<LibXR::GPIO>({"sx1281_nss"})),
+        dio1_(hw.template FindOrExit<LibXR::GPIO>({"sx1281_dio1"})),
+        dio2_(hw.template FindOrExit<LibXR::GPIO>({"sx1281_dio2"})),
+        dio3_(hw.template FindOrExit<LibXR::GPIO>({"sx1281_dio3"})),
+        paen_(hw.template FindOrExit<LibXR::GPIO>({"sx1281_paen"})),
+        lnaen_(hw.template FindOrExit<LibXR::GPIO>({"sx1281_lnaen"})),
+        dcdcen_(hw.template FindOrExit<LibXR::GPIO>({"sx1281_dcdcen"})),
+        busy_(hw.template FindOrExit<LibXR::GPIO>({"sx1281_busy"})),
+        nreset_(hw.template FindOrExit<LibXR::GPIO>({"sx1281_nreset"})),
         spi_op_(spi_sem_, SPI_TIMEOUT_MS),
         free_queue_(SanitizePoolSize(config.packet_pool_size)),
         tx_queue_(SanitizeQueueLength(config.tx_queue_length)),
