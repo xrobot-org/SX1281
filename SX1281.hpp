@@ -3,20 +3,6 @@
 // clang-format off
 /* === MODULE MANIFEST V2 ===
 module_description: XRobot Module for Semtech SX1281/SX1280 2.4 GHz LoRa transceiver
-constructor_args:
-  - config:
-      frequency_hz: 2404000000
-      tx_power_dbm: 13
-      rx_timeout_ms: 1000
-      tx_timeout_ms: 3000
-      auto_tx_period_ms: 500
-      auto_tx_enabled: true
-      irq_task_stack_depth: 2048
-      packet_pool_size: 8
-      tx_queue_length: 4
-      rx_queue_length: 4
-template_args: []
-required_hardware: sx1281_spi sx1281_nss sx1281_dio1 sx1281_dio2 sx1281_dio3 sx1281_paen sx1281_lnaen sx1281_dcdcen sx1281_busy sx1281_nreset
 depends: []
 === END MANIFEST === */
 // clang-format on
@@ -25,15 +11,16 @@ depends: []
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 
-#include "app_framework.hpp"
 #include "gpio.hpp"
+#include "libxr_def.hpp"
 #include "mpmc_queue.hpp"
 #include "semaphore.hpp"
 #include "spi.hpp"
 #include "thread.hpp"
 
-class SX1281 : public LibXR::Application
+class SX1281
 {
  public:
   static constexpr uint8_t MAX_PAYLOAD_SIZE = 255;
@@ -60,17 +47,22 @@ class SX1281 : public LibXR::Application
     size_t rx_queue_length = 4;
   };
 
-  SX1281(LibXR::HardwareContainer& hw, LibXR::ApplicationManager& app, Config config)
-      : spi_(hw.template FindOrExit<LibXR::SPI>({"sx1281_spi"})),
-        nss_(hw.template FindOrExit<LibXR::GPIO>({"sx1281_nss"})),
-        dio1_(hw.template FindOrExit<LibXR::GPIO>({"sx1281_dio1"})),
-        dio2_(hw.template FindOrExit<LibXR::GPIO>({"sx1281_dio2"})),
-        dio3_(hw.template FindOrExit<LibXR::GPIO>({"sx1281_dio3"})),
-        paen_(hw.template FindOrExit<LibXR::GPIO>({"sx1281_paen"})),
-        lnaen_(hw.template FindOrExit<LibXR::GPIO>({"sx1281_lnaen"})),
-        dcdcen_(hw.template FindOrExit<LibXR::GPIO>({"sx1281_dcdcen"})),
-        busy_(hw.template FindOrExit<LibXR::GPIO>({"sx1281_busy"})),
-        nreset_(hw.template FindOrExit<LibXR::GPIO>({"sx1281_nreset"})),
+  SX1281(LibXR::SPI& external_sx1281_spi, LibXR::GPIO& external_sx1281_nss,
+         LibXR::GPIO& external_sx1281_dio1, LibXR::GPIO& external_sx1281_dio2,
+         LibXR::GPIO& external_sx1281_dio3, LibXR::GPIO& external_sx1281_paen,
+         LibXR::GPIO& external_sx1281_lnaen, LibXR::GPIO& external_sx1281_dcdcen,
+         LibXR::GPIO& external_sx1281_busy, LibXR::GPIO& external_sx1281_nreset,
+         Config config)
+      : spi_(std::addressof(external_sx1281_spi)),
+        nss_(std::addressof(external_sx1281_nss)),
+        dio1_(std::addressof(external_sx1281_dio1)),
+        dio2_(std::addressof(external_sx1281_dio2)),
+        dio3_(std::addressof(external_sx1281_dio3)),
+        paen_(std::addressof(external_sx1281_paen)),
+        lnaen_(std::addressof(external_sx1281_lnaen)),
+        dcdcen_(std::addressof(external_sx1281_dcdcen)),
+        busy_(std::addressof(external_sx1281_busy)),
+        nreset_(std::addressof(external_sx1281_nreset)),
         spi_op_(spi_sem_, SPI_TIMEOUT_MS),
         free_queue_(SanitizePoolSize(config.packet_pool_size)),
         tx_queue_(SanitizeQueueLength(config.tx_queue_length)),
@@ -88,7 +80,6 @@ class SX1281 : public LibXR::Application
 
     PrimePacketPool();
 
-    app.Register(*this);
     ConfigurePins();
     ConfigureDio1Interrupt();
 
@@ -120,7 +111,7 @@ class SX1281 : public LibXR::Application
                        LibXR::Thread::Priority::HIGH);
   }
 
-  void OnMonitor() override {}
+  void OnMonitor() {}
 
   Packet* AllocatePacket(uint32_t timeout_ms = 0)
   {
