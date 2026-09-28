@@ -117,8 +117,6 @@ class SX1281
                        LibXR::Thread::Priority::HIGH);
   }
 
-  void OnMonitor() {}
-
   Packet* AllocatePacket(uint32_t timeout_ms = 0)
   {
     UNUSED(timeout_ms);
