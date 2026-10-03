@@ -2,7 +2,7 @@
 
 // clang-format off
 /* === MODULE MANIFEST V2 ===
-module_description: XRobot Module for Semtech SX1281/SX1280 2.4 GHz LoRa transceiver
+module_description: Semtech SX1281 / SX1280 2.4 GHz LoRa 收发器驱动模块（SPI） / Driver module for the Semtech SX1281 / SX1280 2.4 GHz LoRa transceiver over SPI
 depends: []
 === END MANIFEST === */
 // clang-format on
