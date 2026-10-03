@@ -20,33 +20,82 @@ depends: []
 #include "spi.hpp"
 #include "thread.hpp"
 
+/**
+ * @brief SX1281 / SX1280 2.4 GHz LoRa 收发器驱动，提供基于固定包池的分组收发接口。
+ *        Driver for the SX1281 / SX1280 2.4 GHz LoRa transceiver, with a packet
+ *        send/receive API backed by a fixed packet pool.
+ */
 class SX1281
 {
  public:
-  static constexpr uint8_t MAX_PAYLOAD_SIZE = 255;
-  static constexpr size_t PACKET_POOL_CAPACITY = 8;
+  static constexpr uint8_t MAX_PAYLOAD_SIZE = 255;   ///< 最大载荷长度 Max payload size
+  static constexpr size_t PACKET_POOL_CAPACITY = 8;  ///< 包池容量 Pool capacity
+  /// 默认包池大小 Default packet pool size
   static constexpr size_t DEFAULT_PACKET_POOL_SIZE = PACKET_POOL_CAPACITY;
 
+  /**
+   * @brief 收发的数据包，取自包池。
+   *        Data packet taken from the packet pool.
+   */
   struct Packet
   {
-    uint8_t length = 0;
-    uint8_t data[MAX_PAYLOAD_SIZE] = {};
+    uint8_t length = 0;                   ///< 载荷长度，字节 Payload length, bytes
+    uint8_t data[MAX_PAYLOAD_SIZE] = {};  ///< 载荷数据 Payload data
   };
 
+  /**
+   * @brief 构造配置。
+   *        Construction configuration.
+   */
   struct Config
   {
-    uint32_t frequency_hz = 2404000000UL;
-    int8_t tx_power_dbm = 13;
-    uint16_t rx_timeout_ms = 1000;
-    uint16_t tx_timeout_ms = 3000;
-    uint16_t auto_tx_period_ms = 500;
-    bool auto_tx_enabled = true;
-    size_t irq_task_stack_depth = 2048;
-    size_t packet_pool_size = DEFAULT_PACKET_POOL_SIZE;
-    size_t tx_queue_length = 4;
-    size_t rx_queue_length = 4;
+    uint32_t frequency_hz = 2404000000UL;  ///< 射频频率，Hz RF frequency, Hz
+    int8_t tx_power_dbm = 13;              ///< 发射功率，限制在 -18 到 13 dBm
+    ///< TX power, clamped to -18..13 dBm
+    uint16_t rx_timeout_ms = 1000;  ///< 接收超时，1 ms 步长
+    ///< RX timeout in 1 ms steps
+    uint16_t tx_timeout_ms = 3000;  ///< 发送超时，1 ms 步长
+    ///< TX timeout in 1 ms steps
+    uint16_t auto_tx_period_ms = 500;  ///< 自动发送周期，ms Auto TX period, ms
+    bool auto_tx_enabled = true;       ///< 是否周期发送 ashining 信标
+    ///< Whether the ashining beacon is sent periodically
+    size_t irq_task_stack_depth = 2048;  ///< 工作线程栈深 Worker thread stack depth
+    size_t packet_pool_size = DEFAULT_PACKET_POOL_SIZE;  ///< 包池包数，1 到 8
+    ///< Packets in the pool, 1..8
+    size_t tx_queue_length = 4;  ///< 发送队列长度，大于 0
+    ///< TX queue length, greater than 0
+    size_t rx_queue_length = 4;  ///< 接收队列长度，大于 0
+    ///< RX queue length, greater than 0
   };
 
+  /**
+   * @brief 构造 SX1281：配置引脚与 SPI，复位并初始化收发器进入接收，创建 IRQ 工作线程。
+   *        Construct SX1281: configure the pins and the SPI, reset and initialize the
+   *        radio into RX, and create the IRQ worker thread.
+   *
+   * @param spi 连接收发器的 SPI 总线。
+   *            SPI bus connected to the radio.
+   * @param nss SPI 片选 GPIO，输出，低电平有效。
+   *            SPI chip-select GPIO, output, active low.
+   * @param dio1 DIO1 中断线，配置为上升沿中断。
+   *             DIO1 IRQ line, configured as a rising-edge interrupt.
+   * @param dio2 DIO2，配置为输入。
+   *             DIO2, configured as an input.
+   * @param dio3 DIO3，配置为输入。
+   *             DIO3, configured as an input.
+   * @param paen 射频前端 PA 使能 GPIO。
+   *             PA enable GPIO of the RF front end.
+   * @param lnaen 射频前端 LNA 使能 GPIO。
+   *              LNA enable GPIO of the RF front end.
+   * @param dcdcen DC-DC 使能 GPIO，启动时置高。
+   *               DC-DC enable GPIO, driven high at start-up.
+   * @param busy 收发器 BUSY 输入。
+   *             BUSY input of the radio.
+   * @param nreset 收发器 NRESET 输出。
+   *               NRESET output of the radio.
+   * @param config 构造配置。
+   *               Construction configuration.
+   */
   SX1281(
       LibXR::SPI& spi,
       LibXR::GPIO& nss,
@@ -117,6 +166,16 @@ class SX1281
                        LibXR::Thread::Priority::HIGH);
   }
 
+  /**
+   * @brief 从包池取出一个空包，包池为空时立即返回 nullptr。
+   *        Take an empty packet from the pool; returns nullptr immediately when the
+   *        pool is empty.
+   *
+   * @param timeout_ms 保留参数，目前未使用。
+   *                   Reserved, currently unused.
+   * @return 取得的包，所有权属于调用方；包池为空时为 nullptr。
+   *         The packet, owned by the caller; nullptr when the pool is empty.
+   */
   Packet* AllocatePacket(uint32_t timeout_ms = 0)
   {
     UNUSED(timeout_ms);
@@ -138,7 +197,18 @@ class SX1281
     return packet;
   }
 
-  // Ownership moves to the driver only when this returns true.
+  /**
+   * @brief 把包加入发送队列，并唤醒工作线程。
+   *        Queue a packet for transmission and wake the worker thread.
+   *
+   * @param packet 取自 AllocatePacket() 的包，length 须在 1 到 255 之间。
+   *               Packet obtained from AllocatePacket(), with length from 1 to 255.
+   * @return 入队成功为 true，此时包的所有权转移给驱动；length 无效或发送队列已满时为
+   *         false，包仍属于调用方。
+   *         true when queued, in which case ownership moves to the driver; false for
+   *         an invalid length or a full TX queue, in which case the caller keeps the
+   *         packet.
+   */
   bool Send(Packet* packet)
   {
     if (packet == nullptr || packet->length == 0 || packet->length > MAX_PAYLOAD_SIZE)
@@ -164,7 +234,16 @@ class SX1281
     return true;
   }
 
-  // The caller owns the returned packet and must Release() it after processing.
+  /**
+   * @brief 取出一个已收到的包，没有排队的包时立即返回 nullptr。
+   *        Take a received packet; returns nullptr immediately when none is queued.
+   *
+   * @param timeout_ms 保留参数，目前未使用。
+   *                   Reserved, currently unused.
+   * @return 收到的包，处理后须调用 Release() 归还；没有包时为 nullptr。
+   *         The received packet, to be returned with Release() after processing;
+   *         nullptr when none is available.
+   */
   Packet* Receive(uint32_t timeout_ms = 0)
   {
     UNUSED(timeout_ms);
@@ -185,6 +264,13 @@ class SX1281
     return packet;
   }
 
+  /**
+   * @brief 把 AllocatePacket() 或 Receive() 得到的包归还包池。
+   *        Return a packet obtained from AllocatePacket() or Receive() to the pool.
+   *
+   * @param packet 待归还的包。
+   *               Packet to return.
+   */
   void Release(Packet* packet)
   {
     if (packet == nullptr)
@@ -201,16 +287,29 @@ class SX1281
     ReturnToPool(packet);
   }
 
+  /// 芯片 ID Chip ID
   uint16_t ChipId() const { return chip_id_; }
+  /// 初始化已完成 Initialization finished
   bool Ready() const { return ready_; }
+  /// 成功接收的包数 Packets received successfully
   uint32_t RxPackets() const { return rx_packets_; }
+  /// 发送完成的包数 Packets transmitted
   uint32_t TxPackets() const { return tx_packets_; }
+  /// 因包池为空或接收队列已满而丢弃的接收帧数
+  /// Received frames dropped because the pool was empty or the RX queue was full
   uint32_t RxDropped() const { return rx_dropped_; }
+  /// 因包池为空或发送队列已满而丢弃的发送数
+  /// Transmissions dropped because the pool was empty or the TX queue was full
   uint32_t TxDropped() const { return tx_dropped_; }
+  /// 发送失败或超时的包数 Packets that failed or timed out in TX
   uint32_t TxErrors() const { return tx_errors_; }
+  /// 接收队列中的包数 Packets in the RX queue
   size_t RxQueued() { return rx_queue_.Size(); }
+  /// 发送队列中的包数 Packets in the TX queue
   size_t TxQueued() { return tx_queue_.Size(); }
+  /// 包池中的空闲包数 Free packets in the pool
   size_t FreePackets() { return free_queue_.Size(); }
+  /// 包池大小 Packet pool size
   size_t PacketPoolSize() const { return config_.packet_pool_size; }
 
  private:
