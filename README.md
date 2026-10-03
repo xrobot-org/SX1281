@@ -121,7 +121,7 @@ An instance written by `xrobot instance add xrobot-org/SX1281`, with the depende
 ```yaml
 modules:
   - module: xrobot-org/SX1281
-    id: sx1281
+    id: sx1281_0
     args:
       - spi: spi1
       - nss: lora_nss
