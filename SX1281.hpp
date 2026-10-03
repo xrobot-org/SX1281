@@ -144,22 +144,34 @@ class SX1281
     Reset();
 
     uint8_t id[2] = {};
-    ASSERT(ReadRegisters(REG_CHIP_ID, id, sizeof(id)));
+    [[maybe_unused]] bool ok = ReadRegisters(REG_CHIP_ID, id, sizeof(id));
+    ASSERT(ok);
     chip_id_ = static_cast<uint16_t>((static_cast<uint16_t>(id[0]) << 8) | id[1]);
     ASSERT(chip_id_ != 0x0000 && chip_id_ != 0xFFFF);
 
     const uint8_t regulator = REGULATOR_DCDC;
-    ASSERT(WriteCommand(CMD_SET_REGULATOR_MODE, &regulator, 1));
-    ASSERT(SetStandby(STANDBY_RC));
-    ASSERT(SetPacketType(PACKET_TYPE_LORA));
-    ASSERT(SetModulationParams());
-    ASSERT(SetPacketParams(MAX_PAYLOAD_SIZE));
-    ASSERT(SetXoscCap(0x11));
-    ASSERT(SetRfFrequency(config_.frequency_hz));
-    ASSERT(SetBufferBaseAddress(0, 0));
-    ASSERT(SetTxParams(config_.tx_power_dbm, RAMP_02_US));
-    ASSERT(ClearIrqStatus(IRQ_RADIO_ALL));
-    ASSERT(EnterRx());
+    ok = WriteCommand(CMD_SET_REGULATOR_MODE, &regulator, 1);
+    ASSERT(ok);
+    ok = SetStandby(STANDBY_RC);
+    ASSERT(ok);
+    ok = SetPacketType(PACKET_TYPE_LORA);
+    ASSERT(ok);
+    ok = SetModulationParams();
+    ASSERT(ok);
+    ok = SetPacketParams(MAX_PAYLOAD_SIZE);
+    ASSERT(ok);
+    ok = SetXoscCap(0x11);
+    ASSERT(ok);
+    ok = SetRfFrequency(config_.frequency_hz);
+    ASSERT(ok);
+    ok = SetBufferBaseAddress(0, 0);
+    ASSERT(ok);
+    ok = SetTxParams(config_.tx_power_dbm, RAMP_02_US);
+    ASSERT(ok);
+    ok = ClearIrqStatus(IRQ_RADIO_ALL);
+    ASSERT(ok);
+    ok = EnterRx();
+    ASSERT(ok);
 
     ready_ = true;
     last_auto_tx_ms_ = LibXR::Thread::GetTime();
@@ -405,7 +417,8 @@ class SX1281
     {
       packet_pool_[i].length = 0;
       packet_owner_[i] = PacketOwner::FREE;
-      ASSERT(free_queue_.Push(&packet_pool_[i]) == LibXR::ErrorCode::OK);
+      [[maybe_unused]] const auto push_ans = free_queue_.Push(&packet_pool_[i]);
+      ASSERT(push_ans == LibXR::ErrorCode::OK);
     }
   }
 
@@ -440,7 +453,8 @@ class SX1281
   {
     packet->length = 0;
     SetPacketOwner(packet, PacketOwner::FREE);
-    ASSERT(free_queue_.Push(packet) == LibXR::ErrorCode::OK);
+    [[maybe_unused]] const auto push_ans = free_queue_.Push(packet);
+    ASSERT(push_ans == LibXR::ErrorCode::OK);
   }
 
   void ConfigurePins()
@@ -640,7 +654,8 @@ class SX1281
     {
       ReleaseActiveTxPacket();
       tx_errors_++;
-      ASSERT(EnterRx());
+      [[maybe_unused]] const bool rx_ok = EnterRx();
+      ASSERT(rx_ok);
       ready_ = true;
       return true;
     }
@@ -653,7 +668,8 @@ class SX1281
     state_ = State::STANDBY;
     if (!TryStartQueuedTx())
     {
-      ASSERT(EnterRx());
+      [[maybe_unused]] const bool rx_ok = EnterRx();
+      ASSERT(rx_ok);
       ready_ = true;
     }
   }
