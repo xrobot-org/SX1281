@@ -96,18 +96,19 @@ class SX1281
    * @param config 构造配置。
    *               Construction configuration.
    */
-  SX1281(
-      LibXR::SPI& spi,
-      LibXR::GPIO& nss,
-      LibXR::GPIO& dio1,
-      LibXR::GPIO& dio2,
-      LibXR::GPIO& dio3,
-      LibXR::GPIO& paen,
-      LibXR::GPIO& lnaen,
-      LibXR::GPIO& dcdcen,
-      LibXR::GPIO& busy,
-      LibXR::GPIO& nreset,
-      Config config = {.frequency_hz = 2404000000, .tx_power_dbm = 13, .rx_timeout_ms = 1000, .tx_timeout_ms = 3000, .auto_tx_period_ms = 500, .auto_tx_enabled = true, .irq_task_stack_depth = 2048, .packet_pool_size = 8, .tx_queue_length = 4, .rx_queue_length = 4})
+  SX1281(LibXR::SPI& spi, LibXR::GPIO& nss, LibXR::GPIO& dio1, LibXR::GPIO& dio2,
+         LibXR::GPIO& dio3, LibXR::GPIO& paen, LibXR::GPIO& lnaen, LibXR::GPIO& dcdcen,
+         LibXR::GPIO& busy, LibXR::GPIO& nreset,
+         Config config = {.frequency_hz = 2404000000,
+                          .tx_power_dbm = 13,
+                          .rx_timeout_ms = 1000,
+                          .tx_timeout_ms = 3000,
+                          .auto_tx_period_ms = 500,
+                          .auto_tx_enabled = true,
+                          .irq_task_stack_depth = 2048,
+                          .packet_pool_size = 8,
+                          .tx_queue_length = 4,
+                          .rx_queue_length = 4})
       : spi_(std::addressof(spi)),
         nss_(std::addressof(nss)),
         dio1_(std::addressof(dio1)),
@@ -444,21 +445,27 @@ class SX1281
 
   void ConfigurePins()
   {
-    nss_->SetConfig({LibXR::GPIO::Direction::OUTPUT_PUSH_PULL, LibXR::GPIO::Pull::UP});
+    nss_->SetConfig({.direction = LibXR::GPIO::Direction::OUTPUT_PUSH_PULL,
+                     .pull = LibXR::GPIO::Pull::UP});
     nss_->Write(true);
 
-    nreset_->SetConfig(
-        {LibXR::GPIO::Direction::OUTPUT_PUSH_PULL, LibXR::GPIO::Pull::NONE});
-    busy_->SetConfig({LibXR::GPIO::Direction::INPUT, LibXR::GPIO::Pull::NONE});
-    dio1_->SetConfig({LibXR::GPIO::Direction::INPUT, LibXR::GPIO::Pull::NONE});
-    dio2_->SetConfig({LibXR::GPIO::Direction::INPUT, LibXR::GPIO::Pull::NONE});
-    dio3_->SetConfig({LibXR::GPIO::Direction::INPUT, LibXR::GPIO::Pull::NONE});
+    nreset_->SetConfig({.direction = LibXR::GPIO::Direction::OUTPUT_PUSH_PULL,
+                        .pull = LibXR::GPIO::Pull::NONE});
+    busy_->SetConfig(
+        {.direction = LibXR::GPIO::Direction::INPUT, .pull = LibXR::GPIO::Pull::NONE});
+    dio1_->SetConfig(
+        {.direction = LibXR::GPIO::Direction::INPUT, .pull = LibXR::GPIO::Pull::NONE});
+    dio2_->SetConfig(
+        {.direction = LibXR::GPIO::Direction::INPUT, .pull = LibXR::GPIO::Pull::NONE});
+    dio3_->SetConfig(
+        {.direction = LibXR::GPIO::Direction::INPUT, .pull = LibXR::GPIO::Pull::NONE});
 
-    paen_->SetConfig({LibXR::GPIO::Direction::OUTPUT_PUSH_PULL, LibXR::GPIO::Pull::NONE});
-    lnaen_->SetConfig(
-        {LibXR::GPIO::Direction::OUTPUT_PUSH_PULL, LibXR::GPIO::Pull::NONE});
-    dcdcen_->SetConfig(
-        {LibXR::GPIO::Direction::OUTPUT_PUSH_PULL, LibXR::GPIO::Pull::NONE});
+    paen_->SetConfig({.direction = LibXR::GPIO::Direction::OUTPUT_PUSH_PULL,
+                      .pull = LibXR::GPIO::Pull::NONE});
+    lnaen_->SetConfig({.direction = LibXR::GPIO::Direction::OUTPUT_PUSH_PULL,
+                       .pull = LibXR::GPIO::Pull::NONE});
+    dcdcen_->SetConfig({.direction = LibXR::GPIO::Direction::OUTPUT_PUSH_PULL,
+                        .pull = LibXR::GPIO::Pull::NONE});
 
     paen_->Write(false);
     lnaen_->Write(false);
@@ -479,7 +486,8 @@ class SX1281
   void ConfigureDio1Interrupt()
   {
     dio1_->DisableInterrupt();
-    dio1_->SetConfig({LibXR::GPIO::Direction::RISING_INTERRUPT, LibXR::GPIO::Pull::NONE});
+    dio1_->SetConfig({.direction = LibXR::GPIO::Direction::RISING_INTERRUPT,
+                      .pull = LibXR::GPIO::Pull::NONE});
 
     auto irq_cb = LibXR::GPIO::Callback::Create(
         [](bool in_isr, SX1281* radio) { radio->irq_sem_.PostFromCallback(in_isr); },
