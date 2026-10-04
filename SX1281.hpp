@@ -2,7 +2,7 @@
 
 // clang-format off
 /* === MODULE MANIFEST V2 ===
-module_description: Semtech SX1281 / SX1280 2.4 GHz LoRa 收发器驱动模块（SPI） / Driver module for the Semtech SX1281 / SX1280 2.4 GHz LoRa transceiver over SPI
+module_description: Semtech SX1281、SX1280 2.4 GHz LoRa 收发器驱动模块（SPI） / Driver Module for the Semtech SX1281 and SX1280 2.4 GHz LoRa transceivers over SPI
 depends: []
 === END MANIFEST === */
 // clang-format on
