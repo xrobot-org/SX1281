@@ -1,6 +1,6 @@
 # SX1281
 
-Semtech SX1281 / SX1280 2.4 GHz LoRa 收发器驱动模块（SPI） / Driver module for the Semtech SX1281 / SX1280 2.4 GHz LoRa transceiver over SPI
+Semtech SX1281、SX1280 2.4 GHz LoRa 收发器驱动模块（SPI） / Driver Module for the Semtech SX1281 and SX1280 2.4 GHz LoRa transceivers over SPI
 
 ## 1. 模块作用 / Purpose
 
@@ -70,18 +70,18 @@ SX1281(LibXR::SPI& spi,
 - `busy`：收发器的 BUSY 输入。
 - `nreset`：收发器的 NRESET 输出。
 
-配置参数（`Config` 字段，括号内为默认值）：
+配置参数（`Config` 字段）：
 
-- `frequency_hz`：射频频率，单位 Hz（`2404000000`）。
-- `tx_power_dbm`：发射功率，单位 dBm，限制在 -18 到 13（`13`）。
-- `rx_timeout_ms`：传给收发器的接收超时，以 1 ms 为步长（`1000`），超时后模块重新进入接收。
-- `tx_timeout_ms`：发送超时，以 1 ms 为步长（`3000`），超时的包计入 `TxErrors()`。
-- `auto_tx_period_ms`：自动发送周期，单位 ms（`500`）。
-- `auto_tx_enabled`：是否周期发送 `ashining` 信标（`true`）。
-- `irq_task_stack_depth`：工作线程栈深（`2048`）。
-- `packet_pool_size`：包池中的包数，范围 1 到 8（`8`）。
-- `tx_queue_length`：发送队列长度，大于 0（`4`）。
-- `rx_queue_length`：接收队列长度，大于 0（`4`）。
+- `frequency_hz`：射频频率，单位 Hz，默认 `2404000000`。
+- `tx_power_dbm`：发射功率，单位 dBm，限制在 -18 到 13，默认 `13`。
+- `rx_timeout_ms`：传给收发器的接收超时，以 1 ms 为步长，默认 `1000`，超时后模块重新进入接收。
+- `tx_timeout_ms`：发送超时，以 1 ms 为步长，默认 `3000`，超时的包计入 `TxErrors()`。
+- `auto_tx_period_ms`：自动发送周期，单位 ms，默认 `500`。
+- `auto_tx_enabled`：是否周期发送 `ashining` 信标，默认 `true`。
+- `irq_task_stack_depth`：工作线程栈深，单位字节，默认 `2048`。
+- `packet_pool_size`：包池中的包数，范围 1 到 8，默认 `8`。
+- `tx_queue_length`：发送队列长度，大于 0，默认 `4`。
+- `rx_queue_length`：接收队列长度，大于 0，默认 `4`。
 
 Dependencies:
 
@@ -95,18 +95,18 @@ Dependencies:
 - `busy`: the BUSY input of the radio.
 - `nreset`: the NRESET output of the radio.
 
-Configuration parameters (`Config` fields, defaults in parentheses):
+Configuration parameters (`Config` fields):
 
-- `frequency_hz`: RF frequency in Hz (`2404000000`).
-- `tx_power_dbm`: TX power in dBm, clamped to -18 to 13 (`13`).
-- `rx_timeout_ms`: RX timeout passed to the radio in 1 ms steps (`1000`); the Module re-enters RX after a timeout.
-- `tx_timeout_ms`: TX timeout in 1 ms steps (`3000`); a timed-out packet counts in `TxErrors()`.
-- `auto_tx_period_ms`: auto TX period in ms (`500`).
-- `auto_tx_enabled`: whether the `ashining` beacon is sent periodically (`true`).
-- `irq_task_stack_depth`: stack depth of the worker thread (`2048`).
-- `packet_pool_size`: number of packets in the pool, 1 to 8 (`8`).
-- `tx_queue_length`: TX queue length, greater than 0 (`4`).
-- `rx_queue_length`: RX queue length, greater than 0 (`4`).
+- `frequency_hz`: RF frequency in Hz, default `2404000000`.
+- `tx_power_dbm`: TX power in dBm, clamped to -18 to 13, default `13`.
+- `rx_timeout_ms`: RX timeout passed to the radio in 1 ms steps, default `1000`; the Module re-enters RX after a timeout.
+- `tx_timeout_ms`: TX timeout in 1 ms steps, default `3000`; a timed-out packet counts in `TxErrors()`.
+- `auto_tx_period_ms`: auto TX period in ms, default `500`.
+- `auto_tx_enabled`: whether the `ashining` beacon is sent periodically, default `true`.
+- `irq_task_stack_depth`: stack depth of the worker thread in bytes, default `2048`.
+- `packet_pool_size`: number of packets in the pool, 1 to 8, default `8`.
+- `tx_queue_length`: TX queue length, greater than 0, default `4`.
+- `rx_queue_length`: RX queue length, greater than 0, default `4`.
 
 ## 4. Topic
 
@@ -116,7 +116,7 @@ Configuration parameters (`Config` fields, defaults in parentheses):
 
 `xrobot instance add xrobot-org/SX1281` 写入的实例，依赖填写为 BSP 通过 `XR_REGISTER`（硬件注册）注册的名称：
 
-An instance written by `xrobot instance add xrobot-org/SX1281`, with the dependencies set to names registered by the BSP's `XR_REGISTER` (Registration):
+An instance written by `xrobot instance add xrobot-org/SX1281`, with the dependencies set to names registered by the BSP with `XR_REGISTER` (Registration):
 
 ```yaml
 modules:
