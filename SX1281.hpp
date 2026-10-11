@@ -8,6 +8,7 @@ depends: []
 // clang-format on
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -15,8 +16,8 @@ depends: []
 
 #include "gpio.hpp"
 #include "libxr_def.hpp"
-#include "mpmc_queue.hpp"
 #include "semaphore.hpp"
+#include "slot_pool.hpp"
 #include "spi.hpp"
 #include "thread.hpp"
 
@@ -24,6 +25,17 @@ depends: []
  * @brief SX1281 / SX1280 2.4 GHz LoRa 收发器驱动，提供基于固定包池的分组收发接口。
  *        Driver for the SX1281 / SX1280 2.4 GHz LoRa transceiver, with a packet
  *        send/receive API backed by a fixed packet pool.
+ *
+ * 空闲包池、发送队列和接收队列都用 `LibXR::SlotPool`：空闲池只用 `Acquire`/`Release`
+ * 当固定容量的分配器，发送与接收队列用 `Put`/`Get` 传递包指针。用户线程与工作线程
+ * 会同时申请包、入队和出队，`SlotPool` 在这些场合返回的 FULL/EMPTY 反映那一刻的真实
+ * 状态，不会因为某个上下文被抢占而给出瞬时的满/空。
+ *
+ * The free pool, the TX queue and the RX queue are all `LibXR::SlotPool`: the free pool
+ * uses `Acquire`/`Release` as a fixed-capacity allocator, and the TX/RX queues move
+ * packet pointers with `Put`/`Get`. User threads and the worker thread allocate, enqueue
+ * and dequeue concurrently; the FULL/EMPTY `SlotPool` returns there reflects the real
+ * state at that moment instead of a transient one caused by a preempted context.
  */
 class SX1281
 {
@@ -120,9 +132,9 @@ class SX1281
         busy_(std::addressof(busy)),
         nreset_(std::addressof(nreset)),
         spi_op_(spi_sem_, SPI_TIMEOUT_MS),
-        free_queue_(SanitizePoolSize(config.packet_pool_size)),
-        tx_queue_(SanitizeQueueLength(config.tx_queue_length)),
-        rx_queue_(SanitizeQueueLength(config.rx_queue_length)),
+        free_pool_(SanitizePoolSize(config.packet_pool_size)),
+        tx_pool_(SanitizeQueueLength(config.tx_queue_length)),
+        rx_pool_(SanitizeQueueLength(config.rx_queue_length)),
         config_(config)
   {
     ASSERT(config_.packet_pool_size > 0 &&
@@ -192,16 +204,18 @@ class SX1281
   Packet* AllocatePacket(uint32_t timeout_ms = 0)
   {
     UNUSED(timeout_ms);
-    Packet* packet = nullptr;
-    if (free_queue_.Pop(packet) != LibXR::ErrorCode::OK)
+    size_t index = 0;
+    if (free_pool_.Acquire(index) != LibXR::ErrorCode::OK)
     {
       return nullptr;
     }
 
+    Packet* packet = free_pool_.At(index);
     if (packet == nullptr || !PacketFromPool(packet) ||
         !PacketOwnerIs(packet, PacketOwner::FREE))
     {
       ASSERT(false);
+      free_pool_.Release(index);
       return nullptr;
     }
 
@@ -236,7 +250,7 @@ class SX1281
     }
 
     SetPacketOwner(packet, PacketOwner::TX_QUEUE);
-    if (tx_queue_.Push(packet) != LibXR::ErrorCode::OK)
+    if (tx_pool_.Put(packet) != LibXR::ErrorCode::OK)
     {
       SetPacketOwner(packet, PacketOwner::USER);
       tx_dropped_++;
@@ -261,7 +275,7 @@ class SX1281
   {
     UNUSED(timeout_ms);
     Packet* packet = nullptr;
-    if (rx_queue_.Pop(packet) != LibXR::ErrorCode::OK)
+    if (rx_pool_.Get(packet) != LibXR::ErrorCode::OK)
     {
       return nullptr;
     }
@@ -316,12 +330,15 @@ class SX1281
   uint32_t TxDropped() const { return tx_dropped_; }
   /// 发送失败或超时的包数 Packets that failed or timed out in TX
   uint32_t TxErrors() const { return tx_errors_; }
-  /// 接收队列中的包数 Packets in the RX queue
-  size_t RxQueued() { return rx_queue_.Size(); }
-  /// 发送队列中的包数 Packets in the TX queue
-  size_t TxQueued() { return tx_queue_.Size(); }
-  /// 包池中的空闲包数 Free packets in the pool
-  size_t FreePackets() { return free_queue_.Size(); }
+  /// 接收队列中的包数；并发访问时为近似快照
+  /// Packets in the RX queue; an approximate snapshot under concurrent access
+  size_t RxQueued() { return CountPackets(PacketOwner::RX_QUEUE); }
+  /// 发送队列中的包数；并发访问时为近似快照
+  /// Packets in the TX queue; an approximate snapshot under concurrent access
+  size_t TxQueued() { return CountPackets(PacketOwner::TX_QUEUE); }
+  /// 包池中的空闲包数；并发访问时为近似快照
+  /// Free packets in the pool; an approximate snapshot under concurrent access
+  size_t FreePackets() { return CountPackets(PacketOwner::FREE); }
   /// 包池大小 Packet pool size
   size_t PacketPoolSize() const { return config_.packet_pool_size; }
 
@@ -413,12 +430,24 @@ class SX1281
 
   void PrimePacketPool()
   {
+    size_t indices[PACKET_POOL_CAPACITY] = {};
+
+    // 先把全部槽认领出来，把槽下标与包下标绑定一次，再一起放回池里
+    // Claim every slot first, bind each slot index to its packet index once, then
+    // return them all to the pool
     for (size_t i = 0; i < config_.packet_pool_size; i++)
     {
       packet_pool_[i].length = 0;
-      packet_owner_[i] = PacketOwner::FREE;
-      [[maybe_unused]] const auto push_ans = free_queue_.Push(&packet_pool_[i]);
-      ASSERT(push_ans == LibXR::ErrorCode::OK);
+      packet_owner_[i].store(PacketOwner::FREE, std::memory_order_relaxed);
+
+      [[maybe_unused]] const auto acquired = free_pool_.Acquire(indices[i]);
+      ASSERT(acquired == LibXR::ErrorCode::OK);
+      free_pool_.At(indices[i]) = &packet_pool_[indices[i]];
+    }
+
+    for (size_t i = 0; i < config_.packet_pool_size; i++)
+    {
+      free_pool_.Release(indices[i]);
     }
   }
 
@@ -441,20 +470,35 @@ class SX1281
 
   bool PacketOwnerIs(const Packet* packet, PacketOwner owner) const
   {
-    return packet_owner_[PacketIndex(packet)] == owner;
+    return packet_owner_[PacketIndex(packet)].load(std::memory_order_acquire) == owner;
   }
 
   void SetPacketOwner(const Packet* packet, PacketOwner owner)
   {
-    packet_owner_[PacketIndex(packet)] = owner;
+    packet_owner_[PacketIndex(packet)].store(owner, std::memory_order_release);
+  }
+
+  size_t CountPackets(PacketOwner owner) const
+  {
+    size_t count = 0;
+    for (size_t i = 0; i < config_.packet_pool_size; i++)
+    {
+      if (packet_owner_[i].load(std::memory_order_acquire) == owner)
+      {
+        count++;
+      }
+    }
+    return count;
   }
 
   void ReturnToPool(Packet* packet)
   {
     packet->length = 0;
     SetPacketOwner(packet, PacketOwner::FREE);
-    [[maybe_unused]] const auto push_ans = free_queue_.Push(packet);
-    ASSERT(push_ans == LibXR::ErrorCode::OK);
+    // 释放不会失败：在池外（用户、发送队列、接收队列、发送中）的包不占槽，池里始终有空槽
+    // Release cannot fail: packets outside the pool (user, TX queue, RX queue, in TX)
+    // occupy no slot, so a free slot always exists
+    free_pool_.Release(PacketIndex(packet));
   }
 
   void ConfigurePins()
@@ -528,7 +572,7 @@ class SX1281
   {
     ASSERT(ready_);
 
-    if (state_ != State::TX && tx_queue_.Size() > 0)
+    if (state_ != State::TX && CountPackets(PacketOwner::TX_QUEUE) > 0)
     {
       return 0;
     }
@@ -639,7 +683,7 @@ class SX1281
     ASSERT(active_tx_packet_ == nullptr);
 
     Packet* packet = nullptr;
-    if (tx_queue_.Pop(packet) != LibXR::ErrorCode::OK)
+    if (tx_pool_.Get(packet) != LibXR::ErrorCode::OK)
     {
       return false;
     }
@@ -1016,7 +1060,7 @@ class SX1281
     }
 
     SetPacketOwner(packet, PacketOwner::RX_QUEUE);
-    if (rx_queue_.Push(packet) != LibXR::ErrorCode::OK)
+    if (rx_pool_.Put(packet) != LibXR::ErrorCode::OK)
     {
       SetPacketOwner(packet, PacketOwner::USER);
       rx_dropped_++;
@@ -1109,10 +1153,10 @@ class SX1281
   LibXR::Semaphore irq_sem_;
   LibXR::SPI::OperationRW spi_op_;
   Packet packet_pool_[PACKET_POOL_CAPACITY] = {};
-  PacketOwner packet_owner_[PACKET_POOL_CAPACITY] = {};
-  LibXR::MPMCQueue<Packet*> free_queue_;
-  LibXR::MPMCQueue<Packet*> tx_queue_;
-  LibXR::MPMCQueue<Packet*> rx_queue_;
+  std::atomic<PacketOwner> packet_owner_[PACKET_POOL_CAPACITY] = {};
+  LibXR::SlotPool<Packet*> free_pool_;
+  LibXR::SlotPool<Packet*> tx_pool_;
+  LibXR::SlotPool<Packet*> rx_pool_;
   LibXR::Thread irq_thread_;
   Config config_;
 

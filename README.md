@@ -10,6 +10,7 @@ SX1281 使收发器工作在 LoRa 分组模式，驱动 NSS、NRESET、BUSY、DI
 - 工作线程 `sx1281_irq`（`HIGH` 优先级，栈深 `irq_task_stack_depth`）由 DIO1 和 `Send()` 唤醒。它读取 IRQ 状态，把收到的载荷入队，统计 CRC 与包头错误，在发送完成或发送超时时释放已发送的包，然后启动下一个排队的发送，或回到接收。
 - 射频开关跟随收发器状态：发送时 PAEN 为高、LNAEN 为低，接收时 PAEN 为低、LNAEN 为高，待机时两者均为低。
 - 自动发送：`auto_tx_enabled` 为 `true` 且收发器处于接收状态时，工作线程每隔 `auto_tx_period_ms` 发送 8 字节载荷 `ashining`。默认开启，应用自行发送数据时把 `auto_tx_enabled` 设为 `false`。
+- 空闲包池、发送队列与接收队列都由 `SlotPool` 实现：空闲池用 `Acquire`/`Release` 当固定容量的分配器，发送与接收队列用 `Put`/`Get` 传递包指针。用户线程与工作线程会并发申请包、入队和出队，这些操作拿到的满/空反映那一刻的真实状态，不会因为某个上下文被抢占而出现瞬时的满或空。
 
 SX1281 brings the radio up in LoRa packet mode, drives the NSS, NRESET, BUSY, DIO, PA, LNA and DC-DC GPIOs, services the radio from an IRQ-driven worker thread, and provides a fixed-pool, pointer-based packet API (allocate, send, receive, release).
 
@@ -17,6 +18,7 @@ SX1281 brings the radio up in LoRa packet mode, drives the NSS, NRESET, BUSY, DI
 - The worker thread `sx1281_irq` (`HIGH` priority, stack depth `irq_task_stack_depth`) is woken by DIO1 and by `Send()`. It reads the IRQ status, queues received payloads, counts CRC and header errors, releases the transmitted packet on TX done or TX timeout, and then starts the next queued TX or returns to RX.
 - The RF switch follows the radio state: TX has PAEN high and LNAEN low, RX has PAEN low and LNAEN high, standby has both low.
 - Auto TX: while `auto_tx_enabled` is `true` and the radio is in RX, the worker thread sends the 8-byte payload `ashining` every `auto_tx_period_ms`. It is enabled by default; `auto_tx_enabled` is set to `false` when the application sends its own traffic.
+- The free pool, the TX queue and the RX queue are all `SlotPool`s: the free pool uses `Acquire`/`Release` as a fixed-capacity allocator, and the TX and RX queues move packet pointers with `Put`/`Get`. User threads and the worker thread allocate packets, enqueue and dequeue concurrently, and the full/empty these operations observe reflects the real state at that moment instead of a transient one caused by a preempted context.
 
 ## 2. 分组接口 / Packet API
 
@@ -27,7 +29,7 @@ SX1281 brings the radio up in LoRa packet mode, drives the NSS, NRESET, BUSY, DI
 - `Packet* Receive()`：取出一个已收到的包，没有排队的包时返回 `nullptr`。
 - `void Release(Packet* packet)`：把 `AllocatePacket()` 或 `Receive()` 得到的包归还包池。
 
-包池为空或接收队列已满时，收到的帧被丢弃并计入 `RxDropped()`。状态读取函数：`ChipId()`、`Ready()`、`RxPackets()`、`TxPackets()`、`RxDropped()`、`TxDropped()`、`TxErrors()`、`RxQueued()`、`TxQueued()`、`FreePackets()`、`PacketPoolSize()`。
+包池为空或接收队列已满时，收到的帧被丢弃并计入 `RxDropped()`。状态读取函数：`ChipId()`、`Ready()`、`RxPackets()`、`TxPackets()`、`RxDropped()`、`TxDropped()`、`TxErrors()`、`RxQueued()`、`TxQueued()`、`FreePackets()`、`PacketPoolSize()`。`RxQueued()`、`TxQueued()` 与 `FreePackets()` 在并发访问时是近似快照。
 
 其他 Module 把 `SX1281&` 作为构造依赖，并在配置中引用本实例的 id，即可使用该收发器。
 
@@ -38,7 +40,7 @@ The data path is asynchronous and uses a fixed packet pool shared by TX, RX and 
 - `Packet* Receive()`: take a received packet, or `nullptr` when none is queued.
 - `void Release(Packet* packet)`: return a packet obtained from `AllocatePacket()` or `Receive()` to the pool.
 
-Received frames are dropped and counted in `RxDropped()` when the pool is empty or the RX queue is full. Status getters: `ChipId()`, `Ready()`, `RxPackets()`, `TxPackets()`, `RxDropped()`, `TxDropped()`, `TxErrors()`, `RxQueued()`, `TxQueued()`, `FreePackets()`, `PacketPoolSize()`.
+Received frames are dropped and counted in `RxDropped()` when the pool is empty or the RX queue is full. Status getters: `ChipId()`, `Ready()`, `RxPackets()`, `TxPackets()`, `RxDropped()`, `TxDropped()`, `TxErrors()`, `RxQueued()`, `TxQueued()`, `FreePackets()`, `PacketPoolSize()`. `RxQueued()`, `TxQueued()` and `FreePackets()` are approximate snapshots under concurrent access.
 
 Another Module uses the radio by taking `SX1281&` as a constructor dependency and referencing this instance by its id in the configuration.
 
