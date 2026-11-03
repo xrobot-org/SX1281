@@ -24,7 +24,7 @@ SX1281 brings the radio up in LoRa, GFSK or FLRC packet mode and drives the NSS,
 
 - `ErrorCode Start(const Config& config)`：复位并配置射频，结束在接收，阻塞约 22 ms。所有配置命令被接受时返回 `OK`，否则返回 `FAILED`。
 - `uint8_t MaxPayload()`：当前调制下的最大载荷长度。
-- `ErrorCode Send(const uint8_t* data, uint8_t size)`：写入载荷并开始发射就返回，不等发送完成。上一包还在发送时返回 `BUSY`，长度为 0 或超过 `MaxPayload()` 时返回 `ARG_ERR`，SPI 或 BUSY 超时时返回 `FAILED`。
+- `ErrorCode Send(const uint8_t* data, uint8_t size)`：写入载荷并开始发射就返回，不等发送完成。上一包已经发完而还没调用 `Poll()` 时直接从 FS 发出，连续的包之间不进入接收。上一包还在发射时返回 `BUSY`，长度为 0 或超过 `MaxPayload()` 时返回 `ARG_ERR`，SPI 或 BUSY 超时时返回 `FAILED`。
 - `bool Sending()`：是否有包正在发送。
 - `void PrepareSend()`：提前离开接收进入 FS，让收发切换与应用的其他工作重叠；之后不发送而调用 `Poll()` 时重新进入接收。
 - `void Poll()`：推进发送与停顿恢复。
@@ -36,7 +36,7 @@ SX1281 brings the radio up in LoRa, GFSK or FLRC packet mode and drives the NSS,
 
 - `ErrorCode Start(const Config& config)`: reset and configure the radio, ending in receive; blocks about 22 ms. Returns `OK` when every configuration command was accepted, otherwise `FAILED`.
 - `uint8_t MaxPayload()`: the largest payload in the current modulation.
-- `ErrorCode Send(const uint8_t* data, uint8_t size)`: load the payload and start the transmission, then return without waiting for it to finish. Returns `BUSY` while the previous packet is still being sent, `ARG_ERR` for size 0 or above `MaxPayload()`, and `FAILED` on an SPI or BUSY timeout.
+- `ErrorCode Send(const uint8_t* data, uint8_t size)`: load the payload and start the transmission, then return without waiting for it to finish. When the previous packet is done and `Poll()` has not run since, the packet goes out straight from FS, so back-to-back packets do not enter receive in between. Returns `BUSY` while the previous packet is still on air, `ARG_ERR` for size 0 or above `MaxPayload()`, and `FAILED` on an SPI or BUSY timeout.
 - `bool Sending()`: whether a packet is being sent.
 - `void PrepareSend()`: leave receive for FS ahead of a transmission, so that the switch overlaps the application's other work; a `Poll()` without a `Send()` in between listens again.
 - `void Poll()`: advance a transmission and the stall recovery.

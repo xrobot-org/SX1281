@@ -182,27 +182,46 @@ class SX1281
   }
 
   /**
-   * @brief 发送一包：写入载荷并开始发射就返回，发完由 `Poll()` 转回接收。
+   * @brief 发送一包：写入载荷并开始发射就返回，发完由 `Poll()` 转回接收。上一包已经
+   *        发完而 `Poll()` 还没转回接收时，这一包直接从 FS 发出，连续的包之间不进入接收。
    *        Send one packet: load the payload and start the transmission, then return;
-   *        `Poll()` returns to receive once it is done.
+   *        `Poll()` returns to receive once it is done. When the previous packet is done
+   *        and no `Poll()` has returned to receive yet, this one goes out straight from
+   *        FS, so back-to-back packets do not enter receive in between.
    *
-   * @return `OK` 表示已开始发射；上一包还在发送时为 `BUSY`；长度为 0 或超过
+   * @return `OK` 表示已开始发射；上一包还在发射时为 `BUSY`；长度为 0 或超过
    *         `MaxPayload()` 时为 `ARG_ERR`；SPI 或 BUSY 超时时为 `FAILED`。
-   *         `OK` once the packet is on air; `BUSY` while the previous one is still being
-   *         sent; `ARG_ERR` for size 0 or above `MaxPayload()`; `FAILED` on an SPI or
-   *         BUSY timeout.
+   *         `OK` once the packet is on air; `BUSY` while the previous one is still on
+   *         air; `ARG_ERR` for size 0 or above `MaxPayload()`; `FAILED` on an SPI or BUSY
+   *         timeout.
    */
   LibXR::ErrorCode Send(const uint8_t* data, uint8_t size)
   {
-    if (sending_)
-    {
-      return LibXR::ErrorCode::BUSY;
-    }
     if (data == nullptr || size == 0 || size > MaxPayload())
     {
       return LibXR::ErrorCode::ARG_ERR;
     }
-    PrepareSend();
+    if (sending_)
+    {
+      const TxState state = CheckTx();
+      if (state == TxState::ON_AIR)
+      {
+        return LibXR::ErrorCode::BUSY;
+      }
+      // 发完后 AutoFs 停在 FS；超时的包可能还在发射，先回到 FS。
+      // After TxDone, AutoFs stays in FS; a timed-out packet may still be on air, so go
+      // back to FS first.
+      sending_ = false;
+      if (state == TxState::TIMED_OUT)
+      {
+        WriteCommand(CMD_SET_FS, nullptr, 0);
+      }
+      ClearIrq();
+    }
+    else
+    {
+      PrepareSend();
+    }
     prepared_ = false;
     SetRfSwitch(true);
     const bool ok = WriteBuffer(TX_BASE, data, size) && SetPacketParams(size) &&
@@ -234,17 +253,9 @@ class SX1281
   {
     if (sending_)
     {
-      if (!dio1_.Read())
+      if (CheckTx() == TxState::ON_AIR)
       {
-        if (Elapsed(NowUs(), tx_started_us_) < TxTimeoutUs())
-        {
-          return;
-        }
-        tx_errors_++;
-      }
-      else
-      {
-        tx_packets_++;
+        return;
       }
       ClearIrq();
       FinishSend();
@@ -539,6 +550,31 @@ class SX1281
     EnterRx();
     heard_us_ = NowUs();
     return ok;
+  }
+
+  enum class TxState : uint8_t
+  {
+    ON_AIR,
+    DONE,
+    TIMED_OUT
+  };
+
+  // 发送中的包是否结束；结束时计数一次，调用方随后结束这次发送。
+  // Whether the packet on air has ended; an end is counted once, and the caller then
+  // ends this transmission.
+  TxState CheckTx()
+  {
+    if (dio1_.Read())
+    {
+      tx_packets_++;
+      return TxState::DONE;
+    }
+    if (Elapsed(NowUs(), tx_started_us_) < TxTimeoutUs())
+    {
+      return TxState::ON_AIR;
+    }
+    tx_errors_++;
+    return TxState::TIMED_OUT;
   }
 
   void FinishSend()
