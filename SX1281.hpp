@@ -34,7 +34,8 @@ depends: []
  * 之后，什么都收不到，直到重新进入接收（勘误 16.1），所以 PreambleDetected 和
  * SyncWordValid 也锁存在中断状态里，`Poll()` 每 1 ms 查一次，前导码出现 2 ms 没有同步字
  * 就重新进入接收。另外 `rx_rearm_ms` 没收到包时重新进入接收，`rx_restart_ms` 没收到包时
- * 复位并重新配置。
+ * 复位并重新配置；这次复位不阻塞，在之后的 `Poll()` 里分步完成（约 22 ms，期间不收
+ * 不发）。
  *
  * The driver has no execution context of its own: no thread, semaphore or interrupt
  * callback. One caller context calls every member; the caller calls `Poll()`
@@ -51,7 +52,9 @@ depends: []
  * entered again (errata 16.1), so PreambleDetected and SyncWordValid are latched in the
  * IRQ status too; `Poll()` looks every 1 ms and enters receive again when a preamble has
  * had no sync word for 2 ms. It also enters receive again after `rx_rearm_ms` without a
- * packet, and resets and reconfigures the radio after `rx_restart_ms`.
+ * packet, and resets and reconfigures the radio after `rx_restart_ms`; that reset does
+ * not block and completes over the following `Poll()` calls (about 22 ms, during which
+ * nothing is sent or received).
  */
 class SX1281
 {
@@ -170,7 +173,7 @@ class SX1281
    */
   void PrepareSend()
   {
-    if (sending_ || prepared_)
+    if (sending_ || prepared_ || recovery_ != Recovery::NONE)
     {
       return;
     }
@@ -190,16 +193,21 @@ class SX1281
    *        FS, so back-to-back packets do not enter receive in between.
    *
    * @return `OK` 表示已开始发射；上一包还在发射时为 `BUSY`；长度为 0 或超过
-   *         `MaxPayload()` 时为 `ARG_ERR`；SPI 或 BUSY 超时时为 `FAILED`。
+   *         `MaxPayload()` 时为 `ARG_ERR`；SPI 或 BUSY 超时、复位恢复进行中时为
+   *         `FAILED`。
    *         `OK` once the packet is on air; `BUSY` while the previous one is still on
    *         air; `ARG_ERR` for size 0 or above `MaxPayload()`; `FAILED` on an SPI or BUSY
-   *         timeout.
+   *         timeout, or while a recovery reset is in progress.
    */
   LibXR::ErrorCode Send(const uint8_t* data, uint8_t size)
   {
     if (data == nullptr || size == 0 || size > MaxPayload())
     {
       return LibXR::ErrorCode::ARG_ERR;
+    }
+    if (recovery_ != Recovery::NONE)
+    {
+      return LibXR::ErrorCode::FAILED;
     }
     if (sending_)
     {
@@ -251,6 +259,11 @@ class SX1281
    */
   void Poll()
   {
+    if (recovery_ != Recovery::NONE)
+    {
+      AdvanceRecovery();
+      return;
+    }
     if (sending_)
     {
       if (CheckTx() == TxState::ON_AIR)
@@ -287,7 +300,7 @@ class SX1281
    */
   int Receive(uint8_t* out)
   {
-    if (sending_ || prepared_ || !dio1_.Read())
+    if (sending_ || prepared_ || recovery_ != Recovery::NONE || !dio1_.Read())
     {
       return 0;
     }
@@ -338,6 +351,10 @@ class SX1281
     }
     prepared_ = false;
     config_.frequency_hz = frequency_hz;
+    if (recovery_ != Recovery::NONE)
+    {
+      return LibXR::ErrorCode::OK;  // 复位完成时用新频点配置 / used when the reset ends
+    }
     const uint8_t xosc = STANDBY_XOSC;
     const bool ok =
         WriteCommand(CMD_SET_STANDBY, &xosc, 1) && SetRfFrequency(frequency_hz);
@@ -359,7 +376,7 @@ class SX1281
   int16_t RssiInstant()
   {
     uint8_t value = 0;
-    if (!ReadCommand(CMD_GET_RSSI_INST, &value, 1))
+    if (recovery_ != Recovery::NONE || !ReadCommand(CMD_GET_RSSI_INST, &value, 1))
     {
       return 0;
     }
@@ -386,6 +403,8 @@ class SX1281
   // The longest GFSK / FLRC packet takes about 1.3 ms; LoRa SF8 with 255 bytes about
   // 110 ms.
   static constexpr uint32_t TX_TIMEOUT_US = 5000;
+  static constexpr uint32_t RESET_US = 2000;   // 复位保持 / reset held
+  static constexpr uint32_t WAKE_US = 20000;   // 复位后到能接命令 / reset to ready
   static constexpr uint32_t LORA_TX_TIMEOUT_US = 300000;
   static constexpr uint32_t STUCK_CHECK_US = 1000;
   static constexpr uint32_t STUCK_US = 2000;
@@ -548,17 +567,52 @@ class SX1281
     spi_.SetConfig(spi_config);
   }
 
+  // 复位芯片并配置，阻塞约 22 ms（Start()）。 / Reset and configure the chip, blocking
+  // for about 22 ms (Start()).
   bool Restart()
   {
+    HoldReset();
+    LibXR::Timebase::DelayMicroseconds(RESET_US);
+    nreset_.Write(true);
+    LibXR::Timebase::DelayMicroseconds(WAKE_US);
+    return Configure();
+  }
+
+  void HoldReset()
+  {
+    recovery_ = Recovery::NONE;
     sending_ = false;
     prepared_ = false;
     SetRfSwitch(false);
     rxen_.Write(false);
     nreset_.Write(false);
-    LibXR::Timebase::DelayMicroseconds(2000);
-    nreset_.Write(true);
-    LibXR::Timebase::DelayMicroseconds(20000);
+  }
 
+  // 推进不阻塞的复位：保持复位 RESET_US，等芯片醒来 WAKE_US，再配置。
+  // Advance a reset that does not block: hold the reset for RESET_US, wait WAKE_US for
+  // the chip to wake, then configure it.
+  void AdvanceRecovery()
+  {
+    const uint32_t now = NowUs();
+    if (recovery_ == Recovery::IN_RESET)
+    {
+      if (Elapsed(now, recovery_us_) >= RESET_US)
+      {
+        nreset_.Write(true);
+        recovery_ = Recovery::WAKING;
+        recovery_us_ = now;
+      }
+      return;
+    }
+    if (Elapsed(now, recovery_us_) >= WAKE_US)
+    {
+      recovery_ = Recovery::NONE;
+      (void)Configure();  // 失败时静默超时后再复位 / a failure resets again later
+    }
+  }
+
+  bool Configure()
+  {
     // 14.1.1 / 14.3.1 / 14.4.1：STDBY_RC，先设包类型，再设频率、缓冲区、调制和包参数、
     // 同步字与 CRC、发射参数、IRQ 路由。
     // 14.1.1 / 14.3.1 / 14.4.1: STDBY_RC, packet type first, then frequency, buffer,
@@ -654,7 +708,9 @@ class SX1281
     if (Elapsed(now, heard_us_) >= config_.rx_restart_ms * 1000U)
     {
       restarts_++;
-      Restart();
+      HoldReset();
+      recovery_ = Recovery::IN_RESET;
+      recovery_us_ = now;
     }
     else if (Elapsed(now, rearmed_us_) >= config_.rx_rearm_ms * 1000U ||
              PreambleStuck(now))
@@ -890,8 +946,17 @@ class SX1281
   uint8_t tx_[MAX_TRANSFER_SIZE] = {};
   uint8_t rx_[MAX_TRANSFER_SIZE] = {};
 
+  enum class Recovery : uint8_t
+  {
+    NONE,
+    IN_RESET,
+    WAKING
+  };
+
   bool sending_ = false;
   bool prepared_ = false;
+  Recovery recovery_ = Recovery::NONE;
+  uint32_t recovery_us_ = 0;
   bool preamble_seen_ = false;
   uint32_t tx_started_us_ = 0;
   uint32_t heard_us_ = 0;     // 上一个包或启动的时间 / last packet, or start

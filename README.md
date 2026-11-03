@@ -9,7 +9,7 @@ SX1281 使收发器工作在 LoRa、GFSK 或 FLRC 分组模式，驱动 NSS、NR
 - 构造时配置引脚（NSS、NRESET、TXEN、RXEN 为输出，BUSY、DIO1 为输入，给出 DCDCEN 时置高），把 SPI 总线设为 CPOL 低、第一边沿采样、最高 18 MHz，射频保持复位。
 - `Start()` 复位芯片，写入调制、频率、包参数、同步字、CRC 初值和发射功率，然后进入连续接收。三种调制的参数固定：LoRa SF8 / BW 812.5 kHz / CR 4/5，最大 255 字节；GFSK 2 Mb/s，最大 255 字节；FLRC 1.3 Mb/s、无 FEC，最大 127 字节。
 - 射频在收发之间停在 FS。DIO1 只接 TxDone、RxDone 和 CrcError，模块按电平查询 DIO1。
-- `Poll()` 在发送完成或超时后转回接收；接收中没有待取的包时执行停顿恢复：GFSK、FLRC 下前导码出现 2 ms 仍没有同步字时重新进入接收（数据手册勘误 16.1），`rx_rearm_ms` 没收到包时重新进入接收，`rx_restart_ms` 没收到包时复位并重新配置。
+- `Poll()` 在发送完成或超时后转回接收；接收中没有待取的包时执行停顿恢复：GFSK、FLRC 下前导码出现 2 ms 仍没有同步字时重新进入接收（数据手册勘误 16.1），`rx_rearm_ms` 没收到包时重新进入接收，`rx_restart_ms` 没收到包时复位并重新配置；这次复位不阻塞，在之后的 `Poll()` 里分步完成（约 22 ms，期间不收不发）。
 - 射频开关跟随收发器状态：发送时 TXEN 为高、RXEN 为低，接收时 TXEN 为低、RXEN 为高，复位期间两者均为低。
 
 SX1281 brings the radio up in LoRa, GFSK or FLRC packet mode and drives the NSS, NRESET, BUSY, DIO1 and RF switch GPIOs. The Module has no execution context of its own: no thread, semaphore or interrupt callback, and one caller context calls every member. The application configures the radio with `Start()`, sends with `Send()`, fetches packets with `Receive()` and calls `Poll()` periodically.
@@ -17,14 +17,14 @@ SX1281 brings the radio up in LoRa, GFSK or FLRC packet mode and drives the NSS,
 - Construction configures the pins (NSS, NRESET, TXEN and RXEN outputs, BUSY and DIO1 inputs, DCDCEN driven high when given), sets the SPI bus to CPOL low and first-edge sampling at up to 18 MHz, and keeps the radio in reset.
 - `Start()` resets the chip, writes the modulation, frequency, packet parameters, sync word, CRC seed and TX power, and enters continuous receive. The parameters of the three modulations are fixed: LoRa SF8 / BW 812.5 kHz / CR 4/5, up to 255 bytes; GFSK 2 Mb/s, up to 255 bytes; FLRC 1.3 Mb/s without FEC, up to 127 bytes.
 - The radio stays in FS between transmit and receive. Only TxDone, RxDone and CrcError reach DIO1, which the Module reads by level.
-- `Poll()` returns to receive once a transmission is done or has timed out; while receiving with no packet waiting it runs the stall recovery: in GFSK and FLRC it enters receive again when a preamble has had no sync word for 2 ms (datasheet errata 16.1), it enters receive again after `rx_rearm_ms` without a packet, and it resets and reconfigures the radio after `rx_restart_ms`.
+- `Poll()` returns to receive once a transmission is done or has timed out; while receiving with no packet waiting it runs the stall recovery: in GFSK and FLRC it enters receive again when a preamble has had no sync word for 2 ms (datasheet errata 16.1), it enters receive again after `rx_rearm_ms` without a packet, and it resets and reconfigures the radio after `rx_restart_ms`; that reset does not block and completes over the following `Poll()` calls (about 22 ms, during which nothing is sent or received).
 - The RF switch follows the radio state: TX has TXEN high and RXEN low, RX has TXEN low and RXEN high, and both are low during reset.
 
 ## 2. 分组接口 / Packet API
 
 - `ErrorCode Start(const Config& config)`：复位并配置射频，结束在接收，阻塞约 22 ms。所有配置命令被接受时返回 `OK`，否则返回 `FAILED`。
 - `uint8_t MaxPayload()`：当前调制下的最大载荷长度。
-- `ErrorCode Send(const uint8_t* data, uint8_t size)`：写入载荷并开始发射就返回，不等发送完成。上一包已经发完而还没调用 `Poll()` 时直接从 FS 发出，连续的包之间不进入接收。上一包还在发射时返回 `BUSY`，长度为 0 或超过 `MaxPayload()` 时返回 `ARG_ERR`，SPI 或 BUSY 超时时返回 `FAILED`。
+- `ErrorCode Send(const uint8_t* data, uint8_t size)`：写入载荷并开始发射就返回，不等发送完成。上一包已经发完而还没调用 `Poll()` 时直接从 FS 发出，连续的包之间不进入接收。上一包还在发射时返回 `BUSY`，长度为 0 或超过 `MaxPayload()` 时返回 `ARG_ERR`，SPI 或 BUSY 超时、复位恢复进行中时返回 `FAILED`。
 - `bool Sending()`：是否有包正在发送。
 - `void PrepareSend()`：提前离开接收进入 FS，让收发切换与应用的其他工作重叠；之后不发送而调用 `Poll()` 时重新进入接收。
 - `void Poll()`：推进发送与停顿恢复。
@@ -38,7 +38,7 @@ SX1281 brings the radio up in LoRa, GFSK or FLRC packet mode and drives the NSS,
 
 - `ErrorCode Start(const Config& config)`: reset and configure the radio, ending in receive; blocks about 22 ms. Returns `OK` when every configuration command was accepted, otherwise `FAILED`.
 - `uint8_t MaxPayload()`: the largest payload in the current modulation.
-- `ErrorCode Send(const uint8_t* data, uint8_t size)`: load the payload and start the transmission, then return without waiting for it to finish. When the previous packet is done and `Poll()` has not run since, the packet goes out straight from FS, so back-to-back packets do not enter receive in between. Returns `BUSY` while the previous packet is still on air, `ARG_ERR` for size 0 or above `MaxPayload()`, and `FAILED` on an SPI or BUSY timeout.
+- `ErrorCode Send(const uint8_t* data, uint8_t size)`: load the payload and start the transmission, then return without waiting for it to finish. When the previous packet is done and `Poll()` has not run since, the packet goes out straight from FS, so back-to-back packets do not enter receive in between. Returns `BUSY` while the previous packet is still on air, `ARG_ERR` for size 0 or above `MaxPayload()`, and `FAILED` on an SPI or BUSY timeout or while a recovery reset is in progress.
 - `bool Sending()`: whether a packet is being sent.
 - `void PrepareSend()`: leave receive for FS ahead of a transmission, so that the switch overlaps the application's other work; a `Poll()` without a `Send()` in between listens again.
 - `void Poll()`: advance a transmission and the stall recovery.
