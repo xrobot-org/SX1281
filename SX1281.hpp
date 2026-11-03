@@ -320,6 +320,52 @@ class SX1281
     return size;
   }
 
+  /**
+   * @brief 换频点：离开接收，设新频率，回到连续接收；调制、同步字等其余配置不变。之后的
+   *        复位恢复也用这个频点。
+   *        Change the frequency: leave receive, set the new frequency and listen again;
+   *        the modulation, sync word and the rest of the configuration stay. Later
+   *        resets of the stall recovery use this frequency too.
+   *
+   * @return `OK`；发送中为 `BUSY`；SPI 或 BUSY 超时时为 `FAILED`。
+   *         `OK`; `BUSY` while sending; `FAILED` on an SPI or BUSY timeout.
+   */
+  LibXR::ErrorCode Tune(uint32_t frequency_hz)
+  {
+    if (sending_)
+    {
+      return LibXR::ErrorCode::BUSY;
+    }
+    prepared_ = false;
+    config_.frequency_hz = frequency_hz;
+    const uint8_t xosc = STANDBY_XOSC;
+    const bool ok =
+        WriteCommand(CMD_SET_STANDBY, &xosc, 1) && SetRfFrequency(frequency_hz);
+    ClearIrq();
+    EnterRx();
+    return ok ? LibXR::ErrorCode::OK : LibXR::ErrorCode::FAILED;
+  }
+
+  /**
+   * @brief 当前信道上的瞬时 RSSI（GetRssiInst），接收中有效。进入接收后约 300 us 内的
+   *        读数不可靠，调用方丢掉。
+   *        Instantaneous RSSI on the current channel (GetRssiInst), valid while
+   *        receiving. Readings within about 300 us of entering receive are not
+   *        reliable; the caller drops them.
+   *
+   * @return 单位 0.5 dBm，例如 -170 为 -85 dBm；SPI 或 BUSY 超时时为 0。
+   *         In units of 0.5 dBm, e.g. -170 for -85 dBm; 0 on an SPI or BUSY timeout.
+   */
+  int16_t RssiInstant()
+  {
+    uint8_t value = 0;
+    if (!ReadCommand(CMD_GET_RSSI_INST, &value, 1))
+    {
+      return 0;
+    }
+    return static_cast<int16_t>(-static_cast<int16_t>(value));
+  }
+
   uint32_t TxPackets() const { return tx_packets_; }  ///< 发出的包 Packets sent
   /// 发送失败（超时、SPI）的包 Packets whose transmission failed (timeout, SPI)
   uint32_t TxErrors() const { return tx_errors_; }
@@ -365,6 +411,7 @@ class SX1281
   static constexpr uint8_t CMD_CLEAR_IRQ_STATUS = 0x97;
   static constexpr uint8_t CMD_SET_AUTO_FS = 0x9E;
   static constexpr uint8_t CMD_SET_FS = 0xC1;
+  static constexpr uint8_t CMD_GET_RSSI_INST = 0x1F;
 
   static constexpr uint16_t REG_CRC_SEED = 0x09C8;
   static constexpr uint16_t REG_SYNC_WORD_1 = 0x09CE;
