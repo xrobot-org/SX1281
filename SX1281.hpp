@@ -292,7 +292,11 @@ class SX1281
       return 0;
     }
     heard_us_ = rearmed_us_ = NowUs();
-    const uint16_t irq = GetIrqStatus();
+    // 下一包可能紧跟着到，少一条命令就早一点读到缓冲：GFSK、FLRC 的错误看包状态，只有
+    // LoRa 读 IRQ。
+    // The next packet may follow right behind, so every command saved reaches the buffer
+    // sooner: GFSK and FLRC errors come from the packet status, only LoRa reads the IRQs.
+    const uint16_t irq = config_.modulation == Modulation::LORA ? GetIrqStatus() : 0;
     ClearIrq();
     if ((irq & (IRQ_CRC_ERROR | IRQ_HEADER_ERROR)) != 0 || PacketStatusBad())
     {
