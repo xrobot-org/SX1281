@@ -700,12 +700,17 @@ class SX1281
     bool ok = ans == LibXR::ErrorCode::OK;
     if (ok)
     {
-      const uint32_t start = NowUs();
+      // 轮询传输返回时已经完成，这时不读时间。 / A polled transfer is done when it
+      // returns; the time is read only otherwise.
       auto status = spi_status_.load(std::memory_order_acquire);
-      while (status == LibXR::SPI::OperationRW::OperationPollingStatus::RUNNING &&
-             Elapsed(NowUs(), start) < SPI_TIMEOUT_US)
+      if (status == LibXR::SPI::OperationRW::OperationPollingStatus::RUNNING)
       {
-        status = spi_status_.load(std::memory_order_acquire);
+        const uint32_t start = NowUs();
+        while (status == LibXR::SPI::OperationRW::OperationPollingStatus::RUNNING &&
+               Elapsed(NowUs(), start) < SPI_TIMEOUT_US)
+        {
+          status = spi_status_.load(std::memory_order_acquire);
+        }
       }
       ok = status == LibXR::SPI::OperationRW::OperationPollingStatus::DONE;
     }
