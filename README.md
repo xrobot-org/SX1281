@@ -9,7 +9,7 @@ SX1281 使收发器工作在 LoRa、GFSK 或 FLRC 分组模式，驱动 NSS、NR
 - 构造时配置引脚（NSS、NRESET、TXEN、RXEN 为输出，BUSY、DIO1 为输入，给出 DCDCEN 时置高），把 SPI 总线设为 CPOL 低、第一边沿采样、最高 18 MHz，射频保持复位。
 - `Start()` 复位芯片，写入调制、频率、包参数、同步字、CRC 初值和发射功率，然后进入连续接收。三种调制的参数固定：LoRa SF8 / BW 812.5 kHz / CR 4/5，最大 255 字节；GFSK 2 Mb/s，最大 255 字节；FLRC 1.3 Mb/s、无 FEC，最大 127 字节。
 - 射频在收发之间停在 FS。DIO1 只接 TxDone、RxDone 和 CrcError，模块按电平查询 DIO1。
-- `Poll()` 在发送完成或超时后转回接收；接收中没有待取的包时执行停顿恢复：GFSK、FLRC 下前导码出现 2 ms 仍没有同步字时重新进入接收（数据手册勘误 16.1），`rx_rearm_ms` 没收到包时重新进入接收，`rx_restart_ms` 没收到包时复位并重新配置；这次复位不阻塞，在之后的 `Poll()` 里分步完成（约 22 ms，期间不收不发）。
+- `Poll()` 在发送完成或超时后转回接收；接收中没有待取的包时执行停顿恢复：GFSK、FLRC 下前导码出现 2 ms 仍没有同步字时重新进入接收（数据手册勘误 16.1），`rx_rearm_ms` 没收到包且没有包正在到达时重新进入接收，`rx_restart_ms` 没收到包时复位并重新配置；这次复位不阻塞，在之后的 `Poll()` 里分步完成（约 22 ms，期间不收不发）。
 - 射频开关跟随收发器状态：发送时 TXEN 为高、RXEN 为低，接收时 TXEN 为低、RXEN 为高，复位期间两者均为低。
 
 SX1281 brings the radio up in LoRa, GFSK or FLRC packet mode and drives the NSS, NRESET, BUSY, DIO1 and RF switch GPIOs. The Module has no execution context of its own: no thread, semaphore or interrupt callback, and one caller context calls every member. The application configures the radio with `Start()`, sends with `Send()`, fetches packets with `Receive()` and calls `Poll()` periodically.
@@ -17,7 +17,7 @@ SX1281 brings the radio up in LoRa, GFSK or FLRC packet mode and drives the NSS,
 - Construction configures the pins (NSS, NRESET, TXEN and RXEN outputs, BUSY and DIO1 inputs, DCDCEN driven high when given), sets the SPI bus to CPOL low and first-edge sampling at up to 18 MHz, and keeps the radio in reset.
 - `Start()` resets the chip, writes the modulation, frequency, packet parameters, sync word, CRC seed and TX power, and enters continuous receive. The parameters of the three modulations are fixed: LoRa SF8 / BW 812.5 kHz / CR 4/5, up to 255 bytes; GFSK 2 Mb/s, up to 255 bytes; FLRC 1.3 Mb/s without FEC, up to 127 bytes.
 - The radio stays in FS between transmit and receive. Only TxDone, RxDone and CrcError reach DIO1, which the Module reads by level.
-- `Poll()` returns to receive once a transmission is done or has timed out; while receiving with no packet waiting it runs the stall recovery: in GFSK and FLRC it enters receive again when a preamble has had no sync word for 2 ms (datasheet errata 16.1), it enters receive again after `rx_rearm_ms` without a packet, and it resets and reconfigures the radio after `rx_restart_ms`; that reset does not block and completes over the following `Poll()` calls (about 22 ms, during which nothing is sent or received).
+- `Poll()` returns to receive once a transmission is done or has timed out; while receiving with no packet waiting it runs the stall recovery: in GFSK and FLRC it enters receive again when a preamble has had no sync word for 2 ms (datasheet errata 16.1), it enters receive again after `rx_rearm_ms` without a packet unless one is arriving, and it resets and reconfigures the radio after `rx_restart_ms`; that reset does not block and completes over the following `Poll()` calls (about 22 ms, during which nothing is sent or received).
 - The RF switch follows the radio state: TX has TXEN high and RXEN low, RX has TXEN low and RXEN high, and both are low during reset.
 
 ## 2. 分组接口 / Packet API
@@ -29,8 +29,8 @@ SX1281 brings the radio up in LoRa, GFSK or FLRC packet mode and drives the NSS,
 - `void PrepareSend()`：提前离开接收进入 FS，让收发切换与应用的其他工作重叠；之后不发送而调用 `Poll()` 时重新进入接收。
 - `void Poll()`：推进发送与停顿恢复。
 - `int Receive(uint8_t* out)`：取一个收到的包，`out` 至少 `MaxPayload()` 字节。返回包长；没有包时返回 0；CRC、包头或长度错误的坏包返回 -1。
-- `ErrorCode Tune(uint32_t frequency_hz)`：换频点并回到连续接收，其余配置不变，之后的复位恢复也用这个频点。发送中返回 `BUSY`。
-- `int16_t RssiInstant()`：当前信道的瞬时 RSSI，单位 0.5 dBm（-170 为 -85 dBm），接收中有效；进入接收后约 300 µs 内的读数不可靠。
+- `ErrorCode Tune(uint32_t frequency_hz)`：换频点并回到连续接收，其余配置不变，之后的复位恢复也用这个频点，还没取走的包丢掉。发送中返回 `BUSY`。
+- `int16_t RssiInstant()`：当前信道的瞬时 RSSI，单位 0.5 dBm（-170 为 -85 dBm），接收中有效，不在接收中时为 0；进入接收后约 300 µs 内的读数不可靠。
 
 计数：`TxPackets()`、`TxErrors()`、`RxPackets()`、`RxErrors()`、`Rearms()`、`Restarts()`。
 
@@ -43,8 +43,8 @@ SX1281 brings the radio up in LoRa, GFSK or FLRC packet mode and drives the NSS,
 - `void PrepareSend()`: leave receive for FS ahead of a transmission, so that the switch overlaps the application's other work; a `Poll()` without a `Send()` in between listens again.
 - `void Poll()`: advance a transmission and the stall recovery.
 - `int Receive(uint8_t* out)`: fetch one received packet into `out`, which holds at least `MaxPayload()` bytes. Returns the packet size, 0 when none arrived, and -1 for a bad packet (CRC, header or length error).
-- `ErrorCode Tune(uint32_t frequency_hz)`: change the frequency and listen again, keeping the rest of the configuration; later resets of the stall recovery use this frequency too. Returns `BUSY` while sending.
-- `int16_t RssiInstant()`: the instantaneous RSSI on the current channel in units of 0.5 dBm (-170 is -85 dBm), valid while receiving; readings within about 300 µs of entering receive are not reliable.
+- `ErrorCode Tune(uint32_t frequency_hz)`: change the frequency and listen again, keeping the rest of the configuration; later resets of the stall recovery use this frequency too, and a packet not fetched yet is dropped. Returns `BUSY` while sending.
+- `int16_t RssiInstant()`: the instantaneous RSSI on the current channel in units of 0.5 dBm (-170 is -85 dBm), valid while receiving and 0 otherwise; readings within about 300 µs of entering receive are not reliable.
 
 Counters: `TxPackets()`, `TxErrors()`, `RxPackets()`, `RxErrors()`, `Rearms()`, `Restarts()`.
 

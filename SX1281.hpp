@@ -33,9 +33,9 @@ depends: []
  * GetPacketStatus 的错误字节判断（勘误 16.3）。连续接收可能停在找到前导码、找不到同步字
  * 之后，什么都收不到，直到重新进入接收（勘误 16.1），所以 PreambleDetected 和
  * SyncWordValid 也锁存在中断状态里，`Poll()` 每 1 ms 查一次，前导码出现 2 ms 没有同步字
- * 就重新进入接收。另外 `rx_rearm_ms` 没收到包时重新进入接收，`rx_restart_ms` 没收到包时
- * 复位并重新配置；这次复位不阻塞，在之后的 `Poll()` 里分步完成（约 22 ms，期间不收
- * 不发）。
+ * 就重新进入接收。另外 `rx_rearm_ms` 没收到包且没有包正在到达时重新进入接收，
+ * `rx_restart_ms` 没收到包时复位并重新配置；这次复位不阻塞，在之后的 `Poll()` 里分步
+ * 完成（约 22 ms，期间不收不发）。
  *
  * The driver has no execution context of its own: no thread, semaphore or interrupt
  * callback. One caller context calls every member; the caller calls `Poll()`
@@ -52,9 +52,9 @@ depends: []
  * entered again (errata 16.1), so PreambleDetected and SyncWordValid are latched in the
  * IRQ status too; `Poll()` looks every 1 ms and enters receive again when a preamble has
  * had no sync word for 2 ms. It also enters receive again after `rx_rearm_ms` without a
- * packet, and resets and reconfigures the radio after `rx_restart_ms`; that reset does
- * not block and completes over the following `Poll()` calls (about 22 ms, during which
- * nothing is sent or received).
+ * packet unless one is arriving, and resets and reconfigures the radio after
+ * `rx_restart_ms`; that reset does not block and completes over the following `Poll()`
+ * calls (about 22 ms, during which nothing is sent or received).
  */
 class SX1281
 {
@@ -266,9 +266,14 @@ class SX1281
     }
     if (sending_)
     {
-      if (CheckTx() == TxState::ON_AIR)
+      const TxState state = CheckTx();
+      if (state == TxState::ON_AIR)
       {
         return;
+      }
+      if (state == TxState::TIMED_OUT)
+      {
+        WriteCommand(CMD_SET_FS, nullptr, 0);  // 可能还在发射 / it may still be on air
       }
       ClearIrq();
       FinishSend();
@@ -305,6 +310,7 @@ class SX1281
       return 0;
     }
     heard_us_ = rearmed_us_ = NowUs();
+    arriving_ = false;
     // 下一包可能紧跟着到，少一条命令就早一点读到缓冲：GFSK、FLRC 的错误看包状态，只有
     // LoRa 读 IRQ。
     // The next packet may follow right behind, so every command saved reaches the buffer
@@ -335,10 +341,11 @@ class SX1281
 
   /**
    * @brief 换频点：离开接收，设新频率，回到连续接收；调制、同步字等其余配置不变。之后的
-   *        复位恢复也用这个频点。
+   *        复位恢复也用这个频点。还没取走的包丢掉。
    *        Change the frequency: leave receive, set the new frequency and listen again;
    *        the modulation, sync word and the rest of the configuration stay. Later
-   *        resets of the stall recovery use this frequency too.
+   *        resets of the stall recovery use this frequency too. A packet not fetched yet
+   *        is dropped.
    *
    * @return `OK`；发送中为 `BUSY`；SPI 或 BUSY 超时时为 `FAILED`。
    *         `OK`; `BUSY` while sending; `FAILED` on an SPI or BUSY timeout.
@@ -370,13 +377,15 @@ class SX1281
    *        receiving. Readings within about 300 us of entering receive are not
    *        reliable; the caller drops them.
    *
-   * @return 单位 0.5 dBm，例如 -170 为 -85 dBm；SPI 或 BUSY 超时时为 0。
-   *         In units of 0.5 dBm, e.g. -170 for -85 dBm; 0 on an SPI or BUSY timeout.
+   * @return 单位 0.5 dBm，例如 -170 为 -85 dBm；不在接收中、SPI 或 BUSY 超时时为 0。
+   *         In units of 0.5 dBm, e.g. -170 for -85 dBm; 0 when not receiving and on an
+   *         SPI or BUSY timeout.
    */
   int16_t RssiInstant()
   {
     uint8_t value = 0;
-    if (recovery_ != Recovery::NONE || !ReadCommand(CMD_GET_RSSI_INST, &value, 1))
+    if (sending_ || prepared_ || recovery_ != Recovery::NONE ||
+        !ReadCommand(CMD_GET_RSSI_INST, &value, 1))
     {
       return 0;
     }
@@ -403,8 +412,8 @@ class SX1281
   // The longest GFSK / FLRC packet takes about 1.3 ms; LoRa SF8 with 255 bytes about
   // 110 ms.
   static constexpr uint32_t TX_TIMEOUT_US = 5000;
-  static constexpr uint32_t RESET_US = 2000;   // 复位保持 / reset held
-  static constexpr uint32_t WAKE_US = 20000;   // 复位后到能接命令 / reset to ready
+  static constexpr uint32_t RESET_US = 2000;  // 复位保持 / reset held
+  static constexpr uint32_t WAKE_US = 20000;  // 复位后到能接命令 / reset to ready
   static constexpr uint32_t LORA_TX_TIMEOUT_US = 300000;
   static constexpr uint32_t STUCK_CHECK_US = 1000;
   static constexpr uint32_t STUCK_US = 2000;
@@ -461,12 +470,18 @@ class SX1281
   static constexpr uint16_t IRQ_TX_DONE = 0x0001;
   static constexpr uint16_t IRQ_RX_DONE = 0x0002;
   static constexpr uint16_t IRQ_SYNC_WORD_VALID = 0x0004;
+  static constexpr uint16_t IRQ_HEADER_VALID = 0x0010;
   static constexpr uint16_t IRQ_HEADER_ERROR = 0x0020;
   static constexpr uint16_t IRQ_CRC_ERROR = 0x0040;
   static constexpr uint16_t IRQ_PREAMBLE_DETECTED = 0x8000;
   static constexpr uint16_t IRQ_DIO1 = IRQ_TX_DONE | IRQ_RX_DONE | IRQ_CRC_ERROR;
-  static constexpr uint16_t IRQ_LATCHED =
-      IRQ_DIO1 | IRQ_SYNC_WORD_VALID | IRQ_HEADER_ERROR | IRQ_PREAMBLE_DETECTED;
+  static constexpr uint16_t IRQ_LATCHED = IRQ_DIO1 | IRQ_SYNC_WORD_VALID |
+                                          IRQ_HEADER_VALID | IRQ_HEADER_ERROR |
+                                          IRQ_PREAMBLE_DETECTED;
+  // 这些位锁存着而还没有 RxDone：有包正在到达。 / These latched without an RxDone: a
+  // packet is arriving.
+  static constexpr uint16_t IRQ_ARRIVING =
+      IRQ_SYNC_WORD_VALID | IRQ_HEADER_VALID | IRQ_PREAMBLE_DETECTED;
   // GetPacketStatus 的错误字节（表 11-68）：LengthError、CrcError、AbortError。
   // Error byte of GetPacketStatus (table 11-68): LengthError, CrcError, AbortError.
   static constexpr uint8_t PACKET_ERRORS = 0x20 | 0x10 | 0x08;
@@ -593,6 +608,10 @@ class SX1281
   // the chip to wake, then configure it.
   void AdvanceRecovery()
   {
+    if (recovery_ == Recovery::STOPPED)
+    {
+      return;
+    }
     const uint32_t now = NowUs();
     if (recovery_ == Recovery::IN_RESET)
     {
@@ -697,6 +716,7 @@ class SX1281
     SetRfSwitch(false);
     WriteCommand(CMD_SET_RX, RX_CONTINUOUS, sizeof(RX_CONTINUOUS));
     preamble_seen_ = false;
+    arriving_ = false;
     // 停顿从这里算起：发送之后应答还在路上。 / Silence counts from here: right after a
     // transmission the answer is still on its way.
     rearmed_us_ = NowUs();
@@ -712,7 +732,8 @@ class SX1281
       recovery_ = Recovery::IN_RESET;
       recovery_us_ = now;
     }
-    else if (Elapsed(now, rearmed_us_) >= config_.rx_rearm_ms * 1000U ||
+    else if ((Elapsed(now, rearmed_us_) >= config_.rx_rearm_ms * 1000U &&
+              !PacketArriving(now)) ||
              PreambleStuck(now))
     {
       rearms_++;
@@ -721,6 +742,23 @@ class SX1281
       ClearIrq();
       EnterRx();
     }
+  }
+
+  // 重新进入接收会截断正在到达的包。到达的时间不会超过一个最长包。 / Entering receive
+  // again would cut a packet that is arriving, which takes at most one longest packet.
+  bool PacketArriving(uint32_t now)
+  {
+    if ((GetIrqStatus() & IRQ_ARRIVING) == 0)
+    {
+      arriving_ = false;
+      return false;
+    }
+    if (!arriving_)
+    {
+      arriving_ = true;
+      arriving_us_ = now;
+    }
+    return Elapsed(now, arriving_us_) < TxTimeoutUs();
   }
 
   bool PreambleStuck(uint32_t now)
@@ -948,6 +986,7 @@ class SX1281
 
   enum class Recovery : uint8_t
   {
+    STOPPED,  // Start() 之前，芯片在复位中 / before Start(), the chip is held in reset
     NONE,
     IN_RESET,
     WAKING
@@ -955,8 +994,10 @@ class SX1281
 
   bool sending_ = false;
   bool prepared_ = false;
-  Recovery recovery_ = Recovery::NONE;
+  Recovery recovery_ = Recovery::STOPPED;
   uint32_t recovery_us_ = 0;
+  bool arriving_ = false;
+  uint32_t arriving_us_ = 0;
   bool preamble_seen_ = false;
   uint32_t tx_started_us_ = 0;
   uint32_t heard_us_ = 0;     // 上一个包或启动的时间 / last packet, or start
