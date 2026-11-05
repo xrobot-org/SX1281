@@ -28,7 +28,7 @@ LibXR::ErrorCode SX1281::Start(const Config& config)
 
 uint8_t SX1281::MaxPayload() const
 {
-  return config_.modulation == Modulation::FLRC ? FLRC_MAX_PAYLOAD : MAX_PAYLOAD_SIZE;
+  return Modem().max_payload;
 }
 
 void SX1281::PrepareSend()
@@ -138,7 +138,7 @@ int SX1281::Receive(uint8_t* out)
   // LoRa 读 IRQ。
   // The next packet may follow right behind, so every command saved reaches the buffer
   // sooner: GFSK and FLRC errors come from the packet status, only LoRa reads the IRQs.
-  const uint16_t irq = config_.modulation == Modulation::LORA ? bus_.GetIrqStatus() : 0;
+  const uint16_t irq = Modem().errors_in_packet_status ? 0 : bus_.GetIrqStatus();
   bus_.ClearIrq();
   if ((irq & (IRQ_CRC_ERROR | IRQ_HEADER_ERROR)) != 0 || PacketStatusBad())
   {
@@ -205,11 +205,6 @@ const SX1281Modem& SX1281::Modem() const
     default:
       return SX1281_MODEM_LORA;
   }
-}
-
-uint32_t SX1281::TxTimeoutUs() const
-{
-  return config_.modulation == Modulation::LORA ? LORA_TX_TIMEOUT_US : TX_TIMEOUT_US;
 }
 
 void SX1281::ConfigurePins()
@@ -306,7 +301,7 @@ bool SX1281::Configure()
       bus_.WriteCommand(CMD_SET_MODULATION_PARAMS, modem.modulation,
                    sizeof(modem.modulation)) &&
       SetPacketParams(MaxPayload());
-  if (ok && config_.modulation != Modulation::LORA)
+  if (ok && modem.sync_word != SX1281Modem::SyncWord::NONE)
   {
     ok = WriteSyncWord() && bus_.WriteRegister16(REG_CRC_SEED, config_.crc_seed);
   }
@@ -337,7 +332,7 @@ SX1281::TxState SX1281::CheckTx()
     tx_packets_++;
     return TxState::DONE;
   }
-  if (SX1281Bus::Elapsed(SX1281Bus::NowUs(), tx_started_us_) < TxTimeoutUs())
+  if (SX1281Bus::Elapsed(SX1281Bus::NowUs(), tx_started_us_) < Modem().tx_timeout_us)
   {
     return TxState::ON_AIR;
   }
@@ -402,14 +397,12 @@ bool SX1281::PacketArriving(uint32_t now)
     arriving_ = true;
     arriving_us_ = now;
   }
-  return SX1281Bus::Elapsed(now, arriving_us_) < TxTimeoutUs();
+  return SX1281Bus::Elapsed(now, arriving_us_) < Modem().tx_timeout_us;
 }
 
 bool SX1281::PreambleStuck(uint32_t now)
 {
-  // LoRa 没有这种停顿；它的包也远长于 2 ms。 / LoRa has no such stall, and its packets
-  // are far longer than 2 ms.
-  if (config_.modulation == Modulation::LORA ||
+  if (!Modem().preamble_can_stall ||
       SX1281Bus::Elapsed(now, checked_us_) < STUCK_CHECK_US)
   {
     return false;
@@ -433,12 +426,11 @@ bool SX1281::PreambleStuck(uint32_t now)
 
 bool SX1281::PacketStatusBad()
 {
-  // 勘误 16.3：GFSK、FLRC 的 RxDone 不滤掉 CRC
-  // 错的包，看错误字节（packetStatus[23:16]， 表 11-68）。LoRa 的包状态是 RSSI /
-  // SNR，错误看 IRQ。 Errata 16.3: in GFSK and FLRC, RxDone does not filter packets
-  // with CRC errors; check the error byte (packetStatus[23:16], table 11-68). In LoRa
-  // the packet status is RSSI / SNR, and errors come from the IRQs.
-  if (config_.modulation == Modulation::LORA)
+  // 勘误 16.3：GFSK、FLRC 的 RxDone 不滤掉 CRC 错的包，看错误字节（packetStatus[23:16]，
+  // 表 11-68）。
+  // Errata 16.3: in GFSK and FLRC, RxDone does not filter packets with CRC errors; check
+  // the error byte (packetStatus[23:16], table 11-68).
+  if (!Modem().errors_in_packet_status)
   {
     return false;
   }
@@ -461,18 +453,17 @@ bool SX1281::WriteSyncWord()
   // FLRC uses 0x09CF..0x09D2 only.
   const uint8_t gfsk[5] = {0x00, config_.sync_word[0], config_.sync_word[1],
                            config_.sync_word[2], config_.sync_word[3]};
-  return config_.modulation == Modulation::GFSK
+  return Modem().sync_word == SX1281Modem::SyncWord::FIVE
              ? bus_.WriteRegisters(REG_SYNC_WORD_1, gfsk, sizeof(gfsk))
              : bus_.WriteRegisters(REG_SYNC_WORD_1 + 1, config_.sync_word,
-                              sizeof(config_.sync_word));
+                                   sizeof(config_.sync_word));
 }
 
 bool SX1281::SetPacketParams(uint8_t payload_size)
 {
-  uint8_t params[7];
-  std::memcpy(params, Modem().packet, sizeof(params));
-  // LoRa 的载荷长度在第 3 字节，GFSK / FLRC 在第 5 字节。
-  // The payload size is byte 3 in LoRa and byte 5 in GFSK / FLRC.
-  params[config_.modulation == Modulation::LORA ? 2 : 4] = payload_size;
+  const SX1281Modem& modem = Modem();
+  uint8_t params[sizeof(modem.packet)];
+  std::memcpy(params, modem.packet, sizeof(params));
+  params[modem.payload_size_index] = payload_size;
   return bus_.WriteCommand(CMD_SET_PACKET_PARAMS, params, sizeof(params));
 }

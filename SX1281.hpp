@@ -233,12 +233,6 @@ class SX1281
   uint32_t Restarts() const { return restarts_; }
 
  private:
-  // 最长的 GFSK / FLRC 包约 1.3 ms；LoRa SF8 255 字节约 110 ms。
-  // The longest GFSK / FLRC packet takes about 1.3 ms; LoRa SF8 with 255 bytes about
-  // 110 ms.
-  static constexpr uint32_t TX_TIMEOUT_US = 5000;
-  static constexpr uint32_t LORA_TX_TIMEOUT_US = 300000;
-  static constexpr uint8_t FLRC_MAX_PAYLOAD = 127;
   static constexpr uint32_t RESET_US = 2000;  // 复位保持 / reset held
   static constexpr uint32_t WAKE_US = 20000;  // 复位后到能接命令 / reset to ready
   static constexpr uint32_t STUCK_CHECK_US = 1000;
@@ -260,7 +254,6 @@ class SX1281
   };
 
   const SX1281Modem& Modem() const;
-  uint32_t TxTimeoutUs() const;
   void ConfigurePins();
   bool Restart();
   void HoldReset();
