@@ -20,28 +20,59 @@ SX1281::SX1281(LibXR::SPI& spi, LibXR::GPIO& nss, LibXR::GPIO& busy, LibXR::GPIO
   ConfigurePins();
 }
 
+void SX1281::ConfigurePins()
+{
+  nreset_.SetConfig({.direction = LibXR::GPIO::Direction::OUTPUT_PUSH_PULL,
+                     .pull = LibXR::GPIO::Pull::NONE});
+  nreset_.Write(false);
+  dio1_.SetConfig(
+      {.direction = LibXR::GPIO::Direction::INPUT, .pull = LibXR::GPIO::Pull::NONE});
+  txen_.SetConfig({.direction = LibXR::GPIO::Direction::OUTPUT_PUSH_PULL,
+                   .pull = LibXR::GPIO::Pull::NONE});
+  rxen_.SetConfig({.direction = LibXR::GPIO::Direction::OUTPUT_PUSH_PULL,
+                   .pull = LibXR::GPIO::Pull::NONE});
+  txen_.Write(false);
+  rxen_.Write(false);
+  if (dcdcen_ != nullptr)
+  {
+    dcdcen_->SetConfig({.direction = LibXR::GPIO::Direction::OUTPUT_PUSH_PULL,
+                        .pull = LibXR::GPIO::Pull::NONE});
+    dcdcen_->Write(true);
+  }
+}
+
+const SX1281Modem& SX1281::Modem() const
+{
+  switch (config_.modulation)
+  {
+    case Modulation::GFSK:
+      return SX1281_MODEM_GFSK;
+    case Modulation::FLRC:
+      return SX1281_MODEM_FLRC;
+    case Modulation::LORA:
+    default:
+      return SX1281_MODEM_LORA;
+  }
+}
+
+uint8_t SX1281::MaxPayload() const { return Modem().max_payload; }
+
+// ---------------------------------------------------------------------------------------
+// 公共操作 / Public operations
+// ---------------------------------------------------------------------------------------
+
 LibXR::ErrorCode SX1281::Start(const Config& config)
 {
   config_ = config;
   return Restart() ? LibXR::ErrorCode::OK : LibXR::ErrorCode::FAILED;
 }
 
-uint8_t SX1281::MaxPayload() const
-{
-  return Modem().max_payload;
-}
-
 void SX1281::PrepareSend()
 {
-  if (sending_ || prepared_ || recovery_ != Recovery::NONE)
+  if (state_ == State::RX)
   {
-    return;
+    EnterFs();
   }
-  // 10.8：FS 到发射 27 us；11.6.4：SetTx 前清 IRQ。
-  // 10.8: FS to Tx takes 27 us; 11.6.4: IRQs are cleared before SetTx.
-  bus_.WriteCommand(CMD_SET_FS, nullptr, 0);
-  bus_.ClearIrq();
-  prepared_ = true;
 }
 
 LibXR::ErrorCode SX1281::Send(const uint8_t* data, uint8_t size)
@@ -50,36 +81,32 @@ LibXR::ErrorCode SX1281::Send(const uint8_t* data, uint8_t size)
   {
     return LibXR::ErrorCode::ARG_ERR;
   }
-  if (recovery_ != Recovery::NONE)
+  switch (state_)
   {
-    return LibXR::ErrorCode::FAILED;
-  }
-  if (sending_)
-  {
-    const TxState state = CheckTx();
-    if (state == TxState::ON_AIR)
+    case State::STOPPED:
+    case State::IN_RESET:
+    case State::WAKING:
+      return LibXR::ErrorCode::FAILED;
+    case State::TX:
     {
-      return LibXR::ErrorCode::BUSY;
+      const TxState tx = CheckTx();
+      if (tx == TxState::ON_AIR)
+      {
+        return LibXR::ErrorCode::BUSY;
+      }
+      EndTx(tx);  // 发完后 AutoFs 停在 FS / after TxDone, AutoFs stays in FS
+      break;
     }
-    // 发完后 AutoFs 停在 FS；超时的包可能还在发射，先回到 FS。
-    // After TxDone, AutoFs stays in FS; a timed-out packet may still be on air, so go
-    // back to FS first.
-    sending_ = false;
-    if (state == TxState::TIMED_OUT)
-    {
-      bus_.WriteCommand(CMD_SET_FS, nullptr, 0);
-    }
-    bus_.ClearIrq();
+    case State::RX:
+      EnterFs();
+      break;
+    case State::PREPARED:
+      break;
   }
-  else
-  {
-    PrepareSend();
-  }
-  prepared_ = false;
   SetRfSwitch(true);
   const bool ok = bus_.WriteBuffer(TX_BASE, data, size) && SetPacketParams(size) &&
                   bus_.WriteCommand(CMD_SET_TX, TX_NO_TIMEOUT, sizeof(TX_NO_TIMEOUT));
-  sending_ = true;
+  state_ = State::TX;
   tx_started_us_ = SX1281Bus::NowUs();
   if (!ok)
   {
@@ -92,52 +119,62 @@ LibXR::ErrorCode SX1281::Send(const uint8_t* data, uint8_t size)
 
 void SX1281::Poll()
 {
-  if (recovery_ != Recovery::NONE)
+  switch (state_)
   {
-    AdvanceRecovery();
-    return;
-  }
-  if (sending_)
-  {
-    const TxState state = CheckTx();
-    if (state == TxState::ON_AIR)
+    case State::STOPPED:
+      break;
+    case State::IN_RESET:
     {
-      return;
+      const uint32_t now = SX1281Bus::NowUs();
+      if (SX1281Bus::Elapsed(now, reset_us_) >= RESET_US)
+      {
+        nreset_.Write(true);
+        state_ = State::WAKING;
+        reset_us_ = now;
+      }
+      break;
     }
-    if (state == TxState::TIMED_OUT)
+    case State::WAKING:
+      if (SX1281Bus::Elapsed(SX1281Bus::NowUs(), reset_us_) >= WAKE_US)
+      {
+        (void)Configure();  // 失败时静默超时后再复位 / a failure resets again later
+      }
+      break;
+    case State::TX:
     {
-      bus_.WriteCommand(CMD_SET_FS, nullptr, 0);  // 可能还在发射 / it may still be on air
+      const TxState tx = CheckTx();
+      if (tx != TxState::ON_AIR)
+      {
+        EndTx(tx);
+        FinishSend();
+      }
+      break;
     }
-    bus_.ClearIrq();
-    FinishSend();
-    return;
-  }
-  if (prepared_)
-  {
-    // 准备了发送却没有发：重新接收。 / Prepared for a send that did not come: listen
-    // again.
-    prepared_ = false;
-    EnterRx();
-    return;
-  }
-  if (!dio1_.Read())
-  {
-    Recover();
+    case State::PREPARED:
+      // 准备了发送却没有发：重新接收。 / Prepared for a send that did not come: listen
+      // again.
+      EnterRx();
+      break;
+    case State::RX:
+      if (!dio1_.Read())
+      {
+        Recover();
+      }
+      break;
   }
 }
 
 int SX1281::Receive(uint8_t* out)
 {
-  if (sending_ || prepared_ || recovery_ != Recovery::NONE || !dio1_.Read())
+  if (state_ != State::RX || !dio1_.Read())
   {
     return 0;
   }
-  heard_us_ = rearmed_us_ = SX1281Bus::NowUs();
-  arriving_ = false;
-  // 下一包可能紧跟着到，少一条命令就早一点读到缓冲：GFSK、FLRC 的错误看包状态，只有
-  // LoRa 读 IRQ。
+  watch_.heard_us = watch_.rearmed_us = SX1281Bus::NowUs();
+  watch_.arriving = false;
+  // 下一包可能紧跟着到，少一条命令就早一点读到缓冲。
   // The next packet may follow right behind, so every command saved reaches the buffer
-  // sooner: GFSK and FLRC errors come from the packet status, only LoRa reads the IRQs.
+  // sooner.
   const uint16_t irq = Modem().errors_in_packet_status ? 0 : bus_.GetIrqStatus();
   bus_.ClearIrq();
   if ((irq & (IRQ_CRC_ERROR | IRQ_HEADER_ERROR)) != 0 || PacketStatusBad())
@@ -164,19 +201,18 @@ int SX1281::Receive(uint8_t* out)
 
 LibXR::ErrorCode SX1281::Tune(uint32_t frequency_hz)
 {
-  if (sending_)
+  if (state_ == State::TX)
   {
     return LibXR::ErrorCode::BUSY;
   }
-  prepared_ = false;
   config_.frequency_hz = frequency_hz;
-  if (recovery_ != Recovery::NONE)
+  if (Resetting())
   {
     return LibXR::ErrorCode::OK;  // 复位完成时用新频点配置 / used when the reset ends
   }
   const uint8_t xosc = STANDBY_XOSC;
-  const bool ok =
-      bus_.WriteCommand(CMD_SET_STANDBY, &xosc, 1) && bus_.SetRfFrequency(frequency_hz);
+  const bool ok = bus_.WriteCommand(CMD_SET_STANDBY, &xosc, 1) &&
+                  bus_.SetRfFrequency(frequency_hz);
   bus_.ClearIrq();
   EnterRx();
   return ok ? LibXR::ErrorCode::OK : LibXR::ErrorCode::FAILED;
@@ -185,51 +221,19 @@ LibXR::ErrorCode SX1281::Tune(uint32_t frequency_hz)
 int16_t SX1281::RssiInstant()
 {
   uint8_t value = 0;
-  if (sending_ || prepared_ || recovery_ != Recovery::NONE ||
-      !bus_.ReadCommand(CMD_GET_RSSI_INST, &value, 1))
+  if (state_ != State::RX || !bus_.ReadCommand(CMD_GET_RSSI_INST, &value, 1))
   {
     return 0;
   }
   return static_cast<int16_t>(-static_cast<int16_t>(value));
 }
 
-const SX1281Modem& SX1281::Modem() const
-{
-  switch (config_.modulation)
-  {
-    case Modulation::GFSK:
-      return SX1281_MODEM_GFSK;
-    case Modulation::FLRC:
-      return SX1281_MODEM_FLRC;
-    case Modulation::LORA:
-    default:
-      return SX1281_MODEM_LORA;
-  }
-}
+// ---------------------------------------------------------------------------------------
+// 启动和复位 / Start-up and reset
+// ---------------------------------------------------------------------------------------
 
-void SX1281::ConfigurePins()
-{
-  nreset_.SetConfig({.direction = LibXR::GPIO::Direction::OUTPUT_PUSH_PULL,
-                     .pull = LibXR::GPIO::Pull::NONE});
-  nreset_.Write(false);
-  dio1_.SetConfig(
-      {.direction = LibXR::GPIO::Direction::INPUT, .pull = LibXR::GPIO::Pull::NONE});
-  txen_.SetConfig({.direction = LibXR::GPIO::Direction::OUTPUT_PUSH_PULL,
-                   .pull = LibXR::GPIO::Pull::NONE});
-  rxen_.SetConfig({.direction = LibXR::GPIO::Direction::OUTPUT_PUSH_PULL,
-                   .pull = LibXR::GPIO::Pull::NONE});
-  txen_.Write(false);
-  rxen_.Write(false);
-  if (dcdcen_ != nullptr)
-  {
-    dcdcen_->SetConfig({.direction = LibXR::GPIO::Direction::OUTPUT_PUSH_PULL,
-                        .pull = LibXR::GPIO::Pull::NONE});
-    dcdcen_->Write(true);
-  }
-}
-
-// 复位芯片并配置，阻塞约 22 ms（Start()）。 / Reset and configure the chip, blocking
-// for about 22 ms (Start()).
+// 复位芯片并配置，阻塞约 22 ms（Start()）。 / Reset and configure the chip, blocking for
+// about 22 ms (Start()).
 bool SX1281::Restart()
 {
   HoldReset();
@@ -241,39 +245,10 @@ bool SX1281::Restart()
 
 void SX1281::HoldReset()
 {
-  recovery_ = Recovery::NONE;
-  sending_ = false;
-  prepared_ = false;
+  state_ = State::IN_RESET;
   SetRfSwitch(false);
   rxen_.Write(false);
   nreset_.Write(false);
-}
-
-// 推进不阻塞的复位：保持复位 RESET_US，等芯片醒来 WAKE_US，再配置。
-// Advance a reset that does not block: hold the reset for RESET_US, wait WAKE_US for
-// the chip to wake, then configure it.
-void SX1281::AdvanceRecovery()
-{
-  if (recovery_ == Recovery::STOPPED)
-  {
-    return;
-  }
-  const uint32_t now = SX1281Bus::NowUs();
-  if (recovery_ == Recovery::IN_RESET)
-  {
-    if (SX1281Bus::Elapsed(now, recovery_us_) >= RESET_US)
-    {
-      nreset_.Write(true);
-      recovery_ = Recovery::WAKING;
-      recovery_us_ = now;
-    }
-    return;
-  }
-  if (SX1281Bus::Elapsed(now, recovery_us_) >= WAKE_US)
-  {
-    recovery_ = Recovery::NONE;
-    (void)Configure();  // 失败时静默超时后再复位 / a failure resets again later
-  }
 }
 
 bool SX1281::Configure()
@@ -299,7 +274,7 @@ bool SX1281::Configure()
       bus_.SetRfFrequency(config_.frequency_hz) &&
       bus_.WriteCommand(CMD_SET_BUFFER_BASE_ADDRESS, buffer_base, sizeof(buffer_base)) &&
       bus_.WriteCommand(CMD_SET_MODULATION_PARAMS, modem.modulation,
-                   sizeof(modem.modulation)) &&
+                        sizeof(modem.modulation)) &&
       SetPacketParams(MaxPayload());
   if (ok && modem.sync_word != SX1281Modem::SyncWord::NONE)
   {
@@ -318,13 +293,62 @@ bool SX1281::Configure()
        bus_.WriteCommand(CMD_SET_AUTO_FS, &auto_fs, 1);
   bus_.ClearIrq();
   EnterRx();
-  heard_us_ = SX1281Bus::NowUs();
+  watch_.heard_us = SX1281Bus::NowUs();
   return ok;
 }
 
+bool SX1281::WriteSyncWord()
+{
+  // GFSK：同步字 1 的第 5 字节（0x09CE）为 0，4 字节同步字从 0x09CF 开始；FLRC 只用
+  // 0x09CF..0x09D2。
+  // GFSK: byte 5 of sync word 1 (0x09CE) is 0 and the 4-byte word starts at 0x09CF;
+  // FLRC uses 0x09CF..0x09D2 only.
+  const uint8_t five[5] = {0x00, config_.sync_word[0], config_.sync_word[1],
+                           config_.sync_word[2], config_.sync_word[3]};
+  return Modem().sync_word == SX1281Modem::SyncWord::FIVE
+             ? bus_.WriteRegisters(REG_SYNC_WORD_1, five, sizeof(five))
+             : bus_.WriteRegisters(REG_SYNC_WORD_1 + 1, config_.sync_word,
+                                   sizeof(config_.sync_word));
+}
+
+bool SX1281::SetPacketParams(uint8_t payload_size)
+{
+  const SX1281Modem& modem = Modem();
+  uint8_t params[sizeof(modem.packet)];
+  std::memcpy(params, modem.packet, sizeof(params));
+  params[modem.payload_size_index] = payload_size;
+  return bus_.WriteCommand(CMD_SET_PACKET_PARAMS, params, sizeof(params));
+}
+
+// ---------------------------------------------------------------------------------------
+// 收发切换 / Switching between transmit and receive
+// ---------------------------------------------------------------------------------------
+
+void SX1281::EnterFs()
+{
+  // 10.8：FS 到发射 27 us；11.6.4：SetTx 前清 IRQ。
+  // 10.8: FS to Tx takes 27 us; 11.6.4: IRQs are cleared before SetTx.
+  bus_.WriteCommand(CMD_SET_FS, nullptr, 0);
+  bus_.ClearIrq();
+  state_ = State::PREPARED;
+}
+
+void SX1281::EnterRx()
+{
+  // 11.6.5：调用方在 SetRx 前清 IRQ。 / 11.6.5: the caller clears IRQs before SetRx.
+  SetRfSwitch(false);
+  bus_.WriteCommand(CMD_SET_RX, RX_CONTINUOUS, sizeof(RX_CONTINUOUS));
+  state_ = State::RX;
+  watch_.preamble_seen = false;
+  watch_.arriving = false;
+  // 停顿从这里算起：发送之后应答还在路上。 / Silence counts from here: right after a
+  // transmission the answer is still on its way.
+  watch_.rearmed_us = SX1281Bus::NowUs();
+}
+
 // 发送中的包是否结束；结束时计数一次，调用方随后结束这次发送。
-// Whether the packet on air has ended; an end is counted once, and the caller then
-// ends this transmission.
+// Whether the packet on air has ended; an end is counted once, and the caller then ends
+// this transmission.
 SX1281::TxState SX1281::CheckTx()
 {
   if (dio1_.Read())
@@ -340,40 +364,53 @@ SX1281::TxState SX1281::CheckTx()
   return TxState::TIMED_OUT;
 }
 
+void SX1281::EndTx(TxState state)
+{
+  if (state == TxState::TIMED_OUT)
+  {
+    bus_.WriteCommand(CMD_SET_FS, nullptr, 0);  // 可能还在发射 / it may still be on air
+  }
+  bus_.ClearIrq();
+}
+
 void SX1281::FinishSend()
 {
-  sending_ = false;
   // 接收接受不超过最大值的任意长度（变长模式滤掉更长的包）。
   // Receive accepts any size up to the maximum (variable length drops longer packets).
   SetPacketParams(MaxPayload());
   EnterRx();
 }
 
-void SX1281::EnterRx()
+void SX1281::SetRfSwitch(bool transmit)
 {
-  // 11.6.5：调用方在 SetRx 前清 IRQ。 / 11.6.5: the caller clears IRQs before SetRx.
-  SetRfSwitch(false);
-  bus_.WriteCommand(CMD_SET_RX, RX_CONTINUOUS, sizeof(RX_CONTINUOUS));
-  preamble_seen_ = false;
-  arriving_ = false;
-  // 停顿从这里算起：发送之后应答还在路上。 / Silence counts from here: right after a
-  // transmission the answer is still on its way.
-  rearmed_us_ = SX1281Bus::NowUs();
+  rxen_.Write(!transmit);
+  txen_.Write(transmit);
 }
+
+// ---------------------------------------------------------------------------------------
+// 接收停顿恢复 / Receive stall recovery
+// ---------------------------------------------------------------------------------------
 
 void SX1281::Recover()
 {
   const uint32_t now = SX1281Bus::NowUs();
-  if (SX1281Bus::Elapsed(now, heard_us_) >= config_.rx_restart_ms * 1000U)
+  if (SX1281Bus::Elapsed(now, watch_.heard_us) >= config_.rx_restart_ms * 1000U)
   {
     restarts_++;
     HoldReset();
-    recovery_ = Recovery::IN_RESET;
-    recovery_us_ = now;
+    reset_us_ = now;
+    return;
   }
-  else if ((SX1281Bus::Elapsed(now, rearmed_us_) >= config_.rx_rearm_ms * 1000U &&
-            !PacketArriving(now)) ||
-           PreambleStuck(now))
+  const bool rearm_due =
+      SX1281Bus::Elapsed(now, watch_.rearmed_us) >= config_.rx_rearm_ms * 1000U;
+  const bool check_due = Modem().preamble_can_stall &&
+                         SX1281Bus::Elapsed(now, watch_.checked_us) >= STUCK_CHECK_US;
+  if (!rearm_due && !check_due)
+  {
+    return;
+  }
+  const uint16_t irq = bus_.GetIrqStatus();
+  if ((rearm_due && !PacketArriving(now, irq)) || (check_due && PreambleStuck(now, irq)))
   {
     rearms_++;
     const uint8_t xosc = STANDBY_XOSC;
@@ -383,45 +420,39 @@ void SX1281::Recover()
   }
 }
 
-// 重新进入接收会截断正在到达的包。到达的时间不会超过一个最长包。 / Entering receive
-// again would cut a packet that is arriving, which takes at most one longest packet.
-bool SX1281::PacketArriving(uint32_t now)
+// 重新进入接收会截断正在到达的包。到达的时间不会超过一个最长包。 / Entering receive again
+// would cut a packet that is arriving, which takes at most one longest packet.
+bool SX1281::PacketArriving(uint32_t now, uint16_t irq)
 {
-  if ((bus_.GetIrqStatus() & IRQ_ARRIVING) == 0)
+  if ((irq & IRQ_ARRIVING) == 0)
   {
-    arriving_ = false;
+    watch_.arriving = false;
     return false;
   }
-  if (!arriving_)
+  if (!watch_.arriving)
   {
-    arriving_ = true;
-    arriving_us_ = now;
+    watch_.arriving = true;
+    watch_.arriving_us = now;
   }
-  return SX1281Bus::Elapsed(now, arriving_us_) < Modem().tx_timeout_us;
+  return SX1281Bus::Elapsed(now, watch_.arriving_us) < Modem().tx_timeout_us;
 }
 
-bool SX1281::PreambleStuck(uint32_t now)
+bool SX1281::PreambleStuck(uint32_t now, uint16_t irq)
 {
-  if (!Modem().preamble_can_stall ||
-      SX1281Bus::Elapsed(now, checked_us_) < STUCK_CHECK_US)
-  {
-    return false;
-  }
-  checked_us_ = now;
-  const uint16_t irq = bus_.GetIrqStatus();
+  watch_.checked_us = now;
   if ((irq & IRQ_PREAMBLE_DETECTED) == 0 ||
       (irq & (IRQ_SYNC_WORD_VALID | IRQ_RX_DONE)) != 0)
   {
-    preamble_seen_ = false;
+    watch_.preamble_seen = false;
     return false;
   }
-  if (!preamble_seen_)
+  if (!watch_.preamble_seen)
   {
-    preamble_seen_ = true;
-    preamble_us_ = now;
+    watch_.preamble_seen = true;
+    watch_.preamble_us = now;
     return false;
   }
-  return SX1281Bus::Elapsed(now, preamble_us_) >= STUCK_US;
+  return SX1281Bus::Elapsed(now, watch_.preamble_us) >= STUCK_US;
 }
 
 bool SX1281::PacketStatusBad()
@@ -437,33 +468,4 @@ bool SX1281::PacketStatusBad()
   uint8_t status[5] = {};
   return !bus_.ReadCommand(CMD_GET_PACKET_STATUS, status, sizeof(status)) ||
          (status[2] & PACKET_ERRORS) != 0;
-}
-
-void SX1281::SetRfSwitch(bool transmit)
-{
-  rxen_.Write(!transmit);
-  txen_.Write(transmit);
-}
-
-bool SX1281::WriteSyncWord()
-{
-  // GFSK：同步字 1 的第 5 字节（0x09CE）为 0，4 字节同步字从 0x09CF 开始；FLRC 只用
-  // 0x09CF..0x09D2。
-  // GFSK: byte 5 of sync word 1 (0x09CE) is 0 and the 4-byte word starts at 0x09CF;
-  // FLRC uses 0x09CF..0x09D2 only.
-  const uint8_t gfsk[5] = {0x00, config_.sync_word[0], config_.sync_word[1],
-                           config_.sync_word[2], config_.sync_word[3]};
-  return Modem().sync_word == SX1281Modem::SyncWord::FIVE
-             ? bus_.WriteRegisters(REG_SYNC_WORD_1, gfsk, sizeof(gfsk))
-             : bus_.WriteRegisters(REG_SYNC_WORD_1 + 1, config_.sync_word,
-                                   sizeof(config_.sync_word));
-}
-
-bool SX1281::SetPacketParams(uint8_t payload_size)
-{
-  const SX1281Modem& modem = Modem();
-  uint8_t params[sizeof(modem.packet)];
-  std::memcpy(params, modem.packet, sizeof(params));
-  params[modem.payload_size_index] = payload_size;
-  return bus_.WriteCommand(CMD_SET_PACKET_PARAMS, params, sizeof(params));
 }

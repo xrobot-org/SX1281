@@ -58,7 +58,8 @@ depends: []
 class SX1281
 {
  public:
-  static constexpr uint8_t MAX_PAYLOAD_SIZE = SX1281Regs::MAX_PAYLOAD_SIZE;  ///< 最大载荷长度 Max payload size
+  /// 最大载荷长度 Max payload size
+  static constexpr uint8_t MAX_PAYLOAD_SIZE = SX1281Regs::MAX_PAYLOAD_SIZE;
 
   /**
    * @brief 调制方式。
@@ -174,7 +175,7 @@ class SX1281
    * @brief 是否有包正在发送。
    *        Whether a packet is being sent.
    */
-  bool Sending() const { return sending_; }
+  bool Sending() const { return state_ == State::TX; }
 
   /**
    * @brief 推进收发：发送中等到 TxDone（或超时）就转回接收；接收中没有待取的包时执行
@@ -238,6 +239,18 @@ class SX1281
   static constexpr uint32_t STUCK_CHECK_US = 1000;
   static constexpr uint32_t STUCK_US = 2000;
 
+  /// 射频所处的状态；每个公共成员只看它。 / State of the radio; every public member
+  /// looks at this alone.
+  enum class State : uint8_t
+  {
+    STOPPED,   ///< `Start()` 之前，芯片在复位中 / before `Start()`, held in reset
+    IN_RESET,  ///< 恢复：保持复位 / recovery: holding the reset
+    WAKING,    ///< 恢复：等芯片醒来 / recovery: waiting for the chip to wake
+    RX,        ///< 连续接收 / continuous receive
+    PREPARED,  ///< 在 FS 等 `Send()` / in FS, waiting for `Send()`
+    TX         ///< 发送中，或发完停在 FS / sending, or done and in FS
+  };
+
   enum class TxState : uint8_t
   {
     ON_AIR,
@@ -245,30 +258,47 @@ class SX1281
     TIMED_OUT
   };
 
-  enum class Recovery : uint8_t
+  /// 接收停顿恢复用到的时间和标志。 / Times and flags of the receive stall recovery.
+  struct RxWatch
   {
-    STOPPED,  // Start() 之前，芯片在复位中 / before Start(), the chip is held in reset
-    NONE,
-    IN_RESET,
-    WAKING
+    uint32_t heard_us = 0;       ///< 上一个包或启动的时间 / last packet, or start
+    uint32_t rearmed_us = 0;     ///< 上次进入接收的时间 / last time receive was entered
+    uint32_t checked_us = 0;     ///< 上次查前导码停顿的时间 / last stuck-preamble check
+    bool preamble_seen = false;  ///< 看到了无同步字的前导码 / preamble with no sync word
+    uint32_t preamble_us = 0;    ///< 第一次看到它的时间 / first time it was seen
+    bool arriving = false;       ///< 有包正在到达 / a packet is arriving
+    uint32_t arriving_us = 0;    ///< 第一次看到到达的时间 / first time that was seen
   };
+
+  bool Resetting() const
+  {
+    return state_ == State::STOPPED || state_ == State::IN_RESET ||
+           state_ == State::WAKING;
+  }
 
   const SX1281Modem& Modem() const;
   void ConfigurePins();
+
+  // 启动和复位 / Start-up and reset
   bool Restart();
   void HoldReset();
-  void AdvanceRecovery();
   bool Configure();
-  TxState CheckTx();
-  void FinishSend();
-  void EnterRx();
-  void Recover();
-  bool PacketArriving(uint32_t now);
-  bool PreambleStuck(uint32_t now);
-  bool PacketStatusBad();
-  void SetRfSwitch(bool transmit);
   bool WriteSyncWord();
   bool SetPacketParams(uint8_t payload_size);
+
+  // 收发切换 / Switching between transmit and receive
+  void EnterFs();
+  void EnterRx();
+  TxState CheckTx();
+  void EndTx(TxState state);
+  void FinishSend();
+  void SetRfSwitch(bool transmit);
+
+  // 接收停顿恢复 / Receive stall recovery
+  void Recover();
+  bool PacketArriving(uint32_t now, uint16_t irq);
+  bool PreambleStuck(uint32_t now, uint16_t irq);
+  bool PacketStatusBad();
 
   SX1281Bus bus_;
   LibXR::GPIO& nreset_;
@@ -278,19 +308,10 @@ class SX1281
   LibXR::GPIO* dcdcen_;
   Config config_;
 
-  bool sending_ = false;
-  bool prepared_ = false;
-  Recovery recovery_ = Recovery::STOPPED;
-  uint32_t recovery_us_ = 0;
-  bool arriving_ = false;
-  uint32_t arriving_us_ = 0;
-  bool preamble_seen_ = false;
-  uint32_t tx_started_us_ = 0;
-  uint32_t heard_us_ = 0;     // 上一个包或启动的时间 / last packet, or start
-  uint32_t rearmed_us_ = 0;   // 上次进入接收的时间 / last time receive was entered
-  uint32_t checked_us_ = 0;   // 上次查前导码停顿的时间 / last stuck-preamble check
-  uint32_t preamble_us_ = 0;  // 第一次看到无同步字前导码的时间 / first preamble without
-                              // a sync word
+  State state_ = State::STOPPED;
+  uint32_t reset_us_ = 0;       // 当前复位阶段开始的时间 / start of the reset phase
+  uint32_t tx_started_us_ = 0;  // 这一包开始发送的时间 / start of this transmission
+  RxWatch watch_;
 
   uint32_t tx_packets_ = 0;
   uint32_t tx_errors_ = 0;
