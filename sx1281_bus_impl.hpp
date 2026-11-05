@@ -1,12 +1,13 @@
-#include "sx1281_bus.hpp"
+#pragma once
+
+// SX1281Bus 的实现，由 sx1281_bus.hpp 包含。 / Implementation of SX1281Bus, included by
+// sx1281_bus.hpp.
 
 #include <cstring>
 
 #include "timebase.hpp"
 
-using namespace SX1281Regs;
-
-SX1281Bus::SX1281Bus(LibXR::SPI& spi, LibXR::GPIO& nss, LibXR::GPIO& busy)
+inline SX1281Bus::SX1281Bus(LibXR::SPI& spi, LibXR::GPIO& nss, LibXR::GPIO& busy)
     : spi_(spi), nss_(nss), busy_(busy), spi_op_(spi_status_)
 {
   nss_.SetConfig({.direction = LibXR::GPIO::Direction::OUTPUT_PUSH_PULL,
@@ -27,12 +28,12 @@ SX1281Bus::SX1281Bus(LibXR::SPI& spi, LibXR::GPIO& nss, LibXR::GPIO& busy)
   spi_.SetConfig(spi_config);
 }
 
-uint32_t SX1281Bus::NowUs()
+inline uint32_t SX1281Bus::NowUs()
 {
   return static_cast<uint32_t>(LibXR::Timebase::GetMicroseconds());
 }
 
-bool SX1281Bus::WaitNotBusy()
+inline bool SX1281Bus::WaitNotBusy()
 {
   // 9.1：BUSY 为低时才能开始命令。 / 9.1: a command may start only while BUSY is low.
   if (!busy_.Read())
@@ -50,7 +51,7 @@ bool SX1281Bus::WaitNotBusy()
   return true;
 }
 
-bool SX1281Bus::Exchange(size_t size)
+inline bool SX1281Bus::Exchange(size_t size)
 {
   if (size == 0 || size > MAX_TRANSFER_SIZE || !WaitNotBusy())
   {
@@ -82,7 +83,7 @@ bool SX1281Bus::Exchange(size_t size)
   return ok;
 }
 
-bool SX1281Bus::WriteCommand(uint8_t command, const uint8_t* params, size_t size)
+inline bool SX1281Bus::WriteCommand(uint8_t command, const uint8_t* params, size_t size)
 {
   tx_[0] = command;
   if (size > 0)
@@ -92,7 +93,7 @@ bool SX1281Bus::WriteCommand(uint8_t command, const uint8_t* params, size_t size
   return Exchange(size + 1);
 }
 
-bool SX1281Bus::ReadCommand(uint8_t command, uint8_t* out, size_t size)
+inline bool SX1281Bus::ReadCommand(uint8_t command, uint8_t* out, size_t size)
 {
   tx_[0] = command;
   std::memset(&tx_[1], 0, size + 1);
@@ -104,8 +105,9 @@ bool SX1281Bus::ReadCommand(uint8_t command, uint8_t* out, size_t size)
   return true;
 }
 
-bool SX1281Bus::WriteRegisters(uint16_t address, const uint8_t* data, size_t size)
+inline bool SX1281Bus::WriteRegisters(uint16_t address, const uint8_t* data, size_t size)
 {
+  using namespace SX1281Regs;
   tx_[0] = CMD_WRITE_REGISTER;
   tx_[1] = static_cast<uint8_t>(address >> 8);
   tx_[2] = static_cast<uint8_t>(address);
@@ -113,22 +115,24 @@ bool SX1281Bus::WriteRegisters(uint16_t address, const uint8_t* data, size_t siz
   return Exchange(size + 3);
 }
 
-bool SX1281Bus::WriteRegister16(uint16_t address, uint16_t value)
+inline bool SX1281Bus::WriteRegister16(uint16_t address, uint16_t value)
 {
   const uint8_t data[2] = {static_cast<uint8_t>(value >> 8), static_cast<uint8_t>(value)};
   return WriteRegisters(address, data, sizeof(data));
 }
 
-bool SX1281Bus::WriteBuffer(uint8_t offset, const uint8_t* data, uint8_t size)
+inline bool SX1281Bus::WriteBuffer(uint8_t offset, const uint8_t* data, uint8_t size)
 {
+  using namespace SX1281Regs;
   tx_[0] = CMD_WRITE_BUFFER;
   tx_[1] = offset;
   std::memcpy(&tx_[2], data, size);
   return Exchange(static_cast<size_t>(size) + 2);
 }
 
-bool SX1281Bus::ReadBuffer(uint8_t offset, uint8_t* out, uint8_t size)
+inline bool SX1281Bus::ReadBuffer(uint8_t offset, uint8_t* out, uint8_t size)
 {
+  using namespace SX1281Regs;
   tx_[0] = CMD_READ_BUFFER;
   tx_[1] = offset;
   std::memset(&tx_[2], 0, static_cast<size_t>(size) + 1);
@@ -140,8 +144,9 @@ bool SX1281Bus::ReadBuffer(uint8_t offset, uint8_t* out, uint8_t size)
   return true;
 }
 
-bool SX1281Bus::SetRfFrequency(uint32_t frequency_hz)
+inline bool SX1281Bus::SetRfFrequency(uint32_t frequency_hz)
 {
+  using namespace SX1281Regs;
   const uint32_t reg =
       static_cast<uint32_t>((static_cast<uint64_t>(frequency_hz) << 18) / XTAL_HZ);
   const uint8_t params[3] = {static_cast<uint8_t>(reg >> 16),
@@ -149,8 +154,9 @@ bool SX1281Bus::SetRfFrequency(uint32_t frequency_hz)
   return WriteCommand(CMD_SET_RF_FREQUENCY, params, sizeof(params));
 }
 
-uint16_t SX1281Bus::GetIrqStatus()
+inline uint16_t SX1281Bus::GetIrqStatus()
 {
+  using namespace SX1281Regs;
   uint8_t status[2] = {};
   if (!ReadCommand(CMD_GET_IRQ_STATUS, status, sizeof(status)))
   {
@@ -159,8 +165,9 @@ uint16_t SX1281Bus::GetIrqStatus()
   return static_cast<uint16_t>((static_cast<uint16_t>(status[0]) << 8) | status[1]);
 }
 
-void SX1281Bus::ClearIrq()
+inline void SX1281Bus::ClearIrq()
 {
+  using namespace SX1281Regs;
   const uint8_t all[2] = {0xFF, 0xFF};
   WriteCommand(CMD_CLEAR_IRQ_STATUS, all, sizeof(all));
 }

@@ -55,3 +55,5 @@ class SX1281Bus
   uint8_t tx_[MAX_TRANSFER_SIZE] = {};
   uint8_t rx_[MAX_TRANSFER_SIZE] = {};
 };
+
+#include "sx1281_bus_impl.hpp"

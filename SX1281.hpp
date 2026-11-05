@@ -320,3 +320,5 @@ class SX1281
   uint32_t rearms_ = 0;
   uint32_t restarts_ = 0;
 };
+
+#include "sx1281_impl.hpp"
