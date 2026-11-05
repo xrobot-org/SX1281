@@ -2,1177 +2,323 @@
 
 // clang-format off
 /* === MODULE MANIFEST V2 ===
-module_description: Semtech SX1281、SX1280 2.4 GHz LoRa 收发器驱动模块（SPI） / Driver Module for the Semtech SX1281 and SX1280 2.4 GHz LoRa transceivers over SPI
+module_description: Semtech SX1281、SX1280 2.4 GHz 收发器驱动模块（SPI，LoRa / GFSK / FLRC） / Driver Module for the Semtech SX1281 and SX1280 2.4 GHz transceivers over SPI (LoRa / GFSK / FLRC)
 depends: []
 === END MANIFEST === */
 // clang-format on
 
-#include <algorithm>
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
-#include <memory>
 
 #include "gpio.hpp"
 #include "libxr_def.hpp"
-#include "semaphore.hpp"
-#include "slot_pool.hpp"
 #include "spi.hpp"
-#include "thread.hpp"
+#include "sx1281_bus.hpp"
+#include "sx1281_modem.hpp"
+
 
 /**
- * @brief SX1281 / SX1280 2.4 GHz LoRa 收发器驱动，提供基于固定包池的分组收发接口。
- *        Driver for the SX1281 / SX1280 2.4 GHz LoRa transceiver, with a packet
- *        send/receive API backed by a fixed packet pool.
+ * @brief SX1281 / SX1280 2.4 GHz 收发器驱动，LoRa、GFSK 或 FLRC 分组模式。
+ *        Driver for the SX1281 / SX1280 2.4 GHz transceiver in LoRa, GFSK or FLRC
+ *        packet mode.
  *
- * 空闲包池、发送队列和接收队列都用 `LibXR::SlotPool`：空闲池只用 `Acquire`/`Release`
- * 当固定容量的分配器，发送与接收队列用 `Put`/`Get` 传递包指针。用户线程与工作线程
- * 会同时申请包、入队和出队，`SlotPool` 在这些场合返回的 FULL/EMPTY 反映那一刻的真实
- * 状态，不会因为某个上下文被抢占而给出瞬时的满/空。
+ * 驱动不带执行上下文：没有线程、信号量和中断回调。所有成员由同一个调用方上下文调用；
+ * `Poll()` 由调用方周期调用，推进发送并在接收停顿时恢复。等待 BUSY 时忙等，最长几毫秒；
+ * `Send()` 开始发射就返回，不等发送完成。引用的章节均指 SX1280/SX1281 数据手册
+ * DS_SX1280-1 rev 3.3。
  *
- * The free pool, the TX queue and the RX queue are all `LibXR::SlotPool`: the free pool
- * uses `Acquire`/`Release` as a fixed-capacity allocator, and the TX/RX queues move
- * packet pointers with `Put`/`Get`. User threads and the worker thread allocate, enqueue
- * and dequeue concurrently; the FULL/EMPTY `SlotPool` returns there reflects the real
- * state at that moment instead of a transient one caused by a preempted context.
+ * 射频连续接收，收发之间停在 FS（SetAutoFs，11.6.12）。DIO1 只接 TxDone、RxDone 和
+ * CrcError，所以接收时 DIO1 为高即有包，发送时 DIO1 为高即发完；GFSK、FLRC 下坏包由
+ * GetPacketStatus 的错误字节判断（勘误 16.3）。连续接收可能停在找到前导码、找不到同步字
+ * 之后，什么都收不到，直到重新进入接收（勘误 16.1），所以 PreambleDetected 和
+ * SyncWordValid 也锁存在中断状态里，`Poll()` 每 1 ms 查一次，前导码出现 2 ms 没有同步字
+ * 就重新进入接收。另外 `rx_rearm_ms` 没收到包且没有包正在到达时重新进入接收，
+ * `rx_restart_ms` 没收到包时复位并重新配置；这次复位不阻塞，在之后的 `Poll()` 里分步
+ * 完成（约 22 ms，期间不收不发）。
+ *
+ * The driver has no execution context of its own: no thread, semaphore or interrupt
+ * callback. One caller context calls every member; the caller calls `Poll()`
+ * periodically, which advances a transmission and recovers a stalled receiver. Waits for
+ * BUSY spin, for a few milliseconds at most; `Send()` returns once the packet is on air
+ * and does not wait for TX done. Sections refer to the SX1280/SX1281 datasheet
+ * DS_SX1280-1 rev 3.3.
+ *
+ * The radio receives continuously and stays in FS between transmit and receive
+ * (SetAutoFs, 11.6.12). Only TxDone, RxDone and CrcError reach DIO1, so a high DIO1 means
+ * a packet while receiving and the end of the packet while transmitting; in GFSK and FLRC
+ * the error byte of GetPacketStatus tells a bad packet (errata 16.3). Continuous receive
+ * can stop after a preamble without a sync word and then hear nothing until receive is
+ * entered again (errata 16.1), so PreambleDetected and SyncWordValid are latched in the
+ * IRQ status too; `Poll()` looks every 1 ms and enters receive again when a preamble has
+ * had no sync word for 2 ms. It also enters receive again after `rx_rearm_ms` without a
+ * packet unless one is arriving, and resets and reconfigures the radio after
+ * `rx_restart_ms`; that reset does not block and completes over the following `Poll()`
+ * calls (about 22 ms, during which nothing is sent or received).
  */
 class SX1281
 {
  public:
-  static constexpr uint8_t MAX_PAYLOAD_SIZE = 255;   ///< 最大载荷长度 Max payload size
-  static constexpr size_t PACKET_POOL_CAPACITY = 8;  ///< 包池容量 Pool capacity
-  /// 默认包池大小 Default packet pool size
-  static constexpr size_t DEFAULT_PACKET_POOL_SIZE = PACKET_POOL_CAPACITY;
+  /// 最大载荷长度 Max payload size
+  static constexpr uint8_t MAX_PAYLOAD_SIZE = SX1281Regs::MAX_PAYLOAD_SIZE;
 
   /**
-   * @brief 收发的数据包，取自包池。
-   *        Data packet taken from the packet pool.
+   * @brief 调制方式。
+   *        Modulation.
    */
-  struct Packet
+  enum class Modulation : uint8_t
   {
-    uint8_t length = 0;                   ///< 载荷长度，字节 Payload length, bytes
-    uint8_t data[MAX_PAYLOAD_SIZE] = {};  ///< 载荷数据 Payload data
+    LORA,  ///< LoRa SF8，BW 812.5 kHz，CR 4/5，最大 255 字节 / up to 255 bytes
+    GFSK,  ///< GFSK 2 Mb/s，BT 0.5，调制指数 0.5，最大 255 字节 / up to 255 bytes
+    FLRC   ///< FLRC 1.3 Mb/s，BT 1.0，无 FEC，最大 127 字节 / no FEC, up to 127 bytes
   };
 
   /**
-   * @brief 构造配置。
-   *        Construction configuration.
+   * @brief 射频配置，由 `Start()` 写入。
+   *        Radio configuration, applied by `Start()`.
    */
   struct Config
   {
-    uint32_t frequency_hz = 2404000000UL;  ///< 射频频率，Hz RF frequency, Hz
-    int8_t tx_power_dbm = 13;              ///< 发射功率，限制在 -18 到 13 dBm
-    ///< TX power, clamped to -18..13 dBm
-    uint16_t rx_timeout_ms = 1000;  ///< 接收超时，1 ms 步长
-    ///< RX timeout in 1 ms steps
-    uint16_t tx_timeout_ms = 3000;  ///< 发送超时，1 ms 步长
-    ///< TX timeout in 1 ms steps
-    uint16_t auto_tx_period_ms = 500;  ///< 自动发送周期，ms Auto TX period, ms
-    bool auto_tx_enabled = true;       ///< 是否周期发送 ashining 信标
-    ///< Whether the ashining beacon is sent periodically
-    size_t irq_task_stack_depth = 2048;  ///< 工作线程栈深 Worker thread stack depth
-    size_t packet_pool_size = DEFAULT_PACKET_POOL_SIZE;  ///< 包池包数，1 到 8
-    ///< Packets in the pool, 1..8
-    size_t tx_queue_length = 4;  ///< 发送队列长度，大于 0
-    ///< TX queue length, greater than 0
-    size_t rx_queue_length = 4;  ///< 接收队列长度，大于 0
-    ///< RX queue length, greater than 0
+    Modulation modulation = Modulation::LORA;  ///< 调制方式 Modulation
+    uint32_t frequency_hz = 2404000000UL;      ///< 射频频率，Hz RF frequency, Hz
+    /// 发射功率，限制在 -18 到 13 dBm / TX power, clamped to -18..13 dBm
+    int8_t tx_power_dbm = 13;
+    /// GFSK、FLRC 的 32 位同步字；FLRC 应避开勘误 16.4 列出的值。LoRa 不用。
+    /// 32-bit sync word for GFSK and FLRC; FLRC should avoid the values listed in errata
+    /// 16.4. Unused in LoRa.
+    uint8_t sync_word[4] = {'X', 'R', 'S', 'W'};
+    uint16_t crc_seed = 0xFFFF;  ///< GFSK、FLRC 的 CRC 初值 CRC seed for GFSK and FLRC
+    /// XOSC 负载电容微调值 0..31，负数表示保持芯片默认值。
+    /// XOSC load capacitor trim 0..31; negative keeps the chip default.
+    int8_t xosc_trim = -1;
+    /// 无包多久重新进入接收，ms / Re-enter receive after this long without a packet, ms
+    uint16_t rx_rearm_ms = 100;
+    /// 无包多久复位射频，ms / Reset the radio after this long without a packet, ms
+    uint16_t rx_restart_ms = 2000;
   };
 
   /**
-   * @brief 构造 SX1281：配置引脚与 SPI，复位并初始化收发器进入接收，创建 IRQ 工作线程。
-   *        Construct SX1281: configure the pins and the SPI, reset and initialize the
-   *        radio into RX, and create the IRQ worker thread.
+   * @brief 构造 SX1281：配置引脚与 SPI，射频保持复位直到 `Start()`。
+   *        Construct SX1281: configure the pins and the SPI; the radio stays in reset
+   *        until `Start()`.
    *
-   * @param spi 连接收发器的 SPI 总线。
-   *            SPI bus connected to the radio.
+   * @param spi 连接收发器的 SPI 总线，设为 CPOL 低、第一边沿采样、最高 18 MHz。
+   *            SPI bus connected to the radio, set to CPOL low, first-edge sampling, up
+   *            to 18 MHz.
    * @param nss SPI 片选 GPIO，输出，低电平有效。
    *            SPI chip-select GPIO, output, active low.
-   * @param dio1 DIO1 中断线，配置为上升沿中断。
-   *             DIO1 IRQ line, configured as a rising-edge interrupt.
-   * @param dio2 DIO2，配置为输入。
-   *             DIO2, configured as an input.
-   * @param dio3 DIO3，配置为输入。
-   *             DIO3, configured as an input.
-   * @param paen 射频前端 PA 使能 GPIO。
-   *             PA enable GPIO of the RF front end.
-   * @param lnaen 射频前端 LNA 使能 GPIO。
-   *              LNA enable GPIO of the RF front end.
-   * @param dcdcen DC-DC 使能 GPIO，启动时置高。
-   *               DC-DC enable GPIO, driven high at start-up.
    * @param busy 收发器 BUSY 输入。
    *             BUSY input of the radio.
    * @param nreset 收发器 NRESET 输出。
    *               NRESET output of the radio.
-   * @param config 构造配置。
-   *               Construction configuration.
+   * @param dio1 DIO1 输入，按电平查询。
+   *             DIO1 input, read by level.
+   * @param txen 射频前端发射使能（PA）GPIO。
+   *             Transmit enable (PA) GPIO of the RF front end.
+   * @param rxen 射频前端接收使能（LNA）GPIO。
+   *             Receive enable (LNA) GPIO of the RF front end.
+   * @param dcdcen 可选的 DC-DC 使能 GPIO；给出时置高并选用 DC-DC 稳压器，否则用 LDO。
+   *               Optional DC-DC enable GPIO; when given it is driven high and the DC-DC
+   *               regulator is selected, otherwise the LDO.
    */
-  SX1281(LibXR::SPI& spi, LibXR::GPIO& nss, LibXR::GPIO& dio1, LibXR::GPIO& dio2,
-         LibXR::GPIO& dio3, LibXR::GPIO& paen, LibXR::GPIO& lnaen, LibXR::GPIO& dcdcen,
-         LibXR::GPIO& busy, LibXR::GPIO& nreset,
-         Config config = {.frequency_hz = 2404000000,
-                          .tx_power_dbm = 13,
-                          .rx_timeout_ms = 1000,
-                          .tx_timeout_ms = 3000,
-                          .auto_tx_period_ms = 500,
-                          .auto_tx_enabled = true,
-                          .irq_task_stack_depth = 2048,
-                          .packet_pool_size = 8,
-                          .tx_queue_length = 4,
-                          .rx_queue_length = 4})
-      : spi_(std::addressof(spi)),
-        nss_(std::addressof(nss)),
-        dio1_(std::addressof(dio1)),
-        dio2_(std::addressof(dio2)),
-        dio3_(std::addressof(dio3)),
-        paen_(std::addressof(paen)),
-        lnaen_(std::addressof(lnaen)),
-        dcdcen_(std::addressof(dcdcen)),
-        busy_(std::addressof(busy)),
-        nreset_(std::addressof(nreset)),
-        spi_op_(spi_sem_, SPI_TIMEOUT_MS),
-        free_pool_(SanitizePoolSize(config.packet_pool_size)),
-        tx_pool_(SanitizeQueueLength(config.tx_queue_length)),
-        rx_pool_(SanitizeQueueLength(config.rx_queue_length)),
-        config_(config)
-  {
-    ASSERT(config_.packet_pool_size > 0 &&
-           config_.packet_pool_size <= PACKET_POOL_CAPACITY);
-    ASSERT(config_.tx_queue_length > 0);
-    ASSERT(config_.rx_queue_length > 0);
-
-    config_.packet_pool_size = SanitizePoolSize(config_.packet_pool_size);
-    config_.tx_queue_length = SanitizeQueueLength(config_.tx_queue_length);
-    config_.rx_queue_length = SanitizeQueueLength(config_.rx_queue_length);
-
-    PrimePacketPool();
-
-    ConfigurePins();
-    ConfigureDio1Interrupt();
-
-    state_ = State::STANDBY;
-    SetRfSwitch(State::STANDBY);
-    Reset();
-
-    uint8_t id[2] = {};
-    [[maybe_unused]] bool ok = ReadRegisters(REG_CHIP_ID, id, sizeof(id));
-    ASSERT(ok);
-    chip_id_ = static_cast<uint16_t>((static_cast<uint16_t>(id[0]) << 8) | id[1]);
-    ASSERT(chip_id_ != 0x0000 && chip_id_ != 0xFFFF);
-
-    const uint8_t regulator = REGULATOR_DCDC;
-    ok = WriteCommand(CMD_SET_REGULATOR_MODE, &regulator, 1);
-    ASSERT(ok);
-    ok = SetStandby(STANDBY_RC);
-    ASSERT(ok);
-    ok = SetPacketType(PACKET_TYPE_LORA);
-    ASSERT(ok);
-    ok = SetModulationParams();
-    ASSERT(ok);
-    ok = SetPacketParams(MAX_PAYLOAD_SIZE);
-    ASSERT(ok);
-    ok = SetXoscCap(0x11);
-    ASSERT(ok);
-    ok = SetRfFrequency(config_.frequency_hz);
-    ASSERT(ok);
-    ok = SetBufferBaseAddress(0, 0);
-    ASSERT(ok);
-    ok = SetTxParams(config_.tx_power_dbm, RAMP_02_US);
-    ASSERT(ok);
-    ok = ClearIrqStatus(IRQ_RADIO_ALL);
-    ASSERT(ok);
-    ok = EnterRx();
-    ASSERT(ok);
-
-    ready_ = true;
-    last_auto_tx_ms_ = LibXR::Thread::GetTime();
-    irq_thread_.Create(this, ThreadFunc, "sx1281_irq", config_.irq_task_stack_depth,
-                       LibXR::Thread::Priority::HIGH);
-  }
+  SX1281(LibXR::SPI& spi, LibXR::GPIO& nss, LibXR::GPIO& busy, LibXR::GPIO& nreset,
+         LibXR::GPIO& dio1, LibXR::GPIO& txen, LibXR::GPIO& rxen,
+         LibXR::GPIO* dcdcen = nullptr);
 
   /**
-   * @brief 从包池取出一个空包，包池为空时立即返回 nullptr。
-   *        Take an empty packet from the pool; returns nullptr immediately when the
-   *        pool is empty.
+   * @brief 复位并配置射频，结束时处于接收。
+   *        Reset and configure the radio; ends in receive.
    *
-   * @param timeout_ms 保留参数，目前未使用。
-   *                   Reserved, currently unused.
-   * @return 取得的包，所有权属于调用方；包池为空时为 nullptr。
-   *         The packet, owned by the caller; nullptr when the pool is empty.
+   * @param config 射频配置。
+   *               Radio configuration.
+   * @return 所有配置命令都被接受时为 `OK`，否则为 `FAILED`；失败后 `Poll()` 在
+   *         `rx_restart_ms` 无包后会再次复位。
+   *         `OK` when every configuration command was accepted, otherwise `FAILED`;
+   *         after a failure `Poll()` resets the radio again after `rx_restart_ms`
+   *         without a packet.
+   * @note 复位脉冲与启动共阻塞约 22 ms。
+   *       Blocks about 22 ms for the reset pulse and start-up.
    */
-  Packet* AllocatePacket(uint32_t timeout_ms = 0)
-  {
-    UNUSED(timeout_ms);
-    size_t index = 0;
-    if (free_pool_.Acquire(index) != LibXR::ErrorCode::OK)
-    {
-      return nullptr;
-    }
-
-    Packet* packet = free_pool_.At(index);
-    if (packet == nullptr || !PacketFromPool(packet) ||
-        !PacketOwnerIs(packet, PacketOwner::FREE))
-    {
-      ASSERT(false);
-      free_pool_.Release(index);
-      return nullptr;
-    }
-
-    SetPacketOwner(packet, PacketOwner::USER);
-    packet->length = 0;
-    return packet;
-  }
+  LibXR::ErrorCode Start(const Config& config);
 
   /**
-   * @brief 把包加入发送队列，并唤醒工作线程。
-   *        Queue a packet for transmission and wake the worker thread.
-   *
-   * @param packet 取自 AllocatePacket() 的包，length 须在 1 到 255 之间。
-   *               Packet obtained from AllocatePacket(), with length from 1 to 255.
-   * @return 入队成功为 true，此时包的所有权转移给驱动；length 无效或发送队列已满时为
-   *         false，包仍属于调用方。
-   *         true when queued, in which case ownership moves to the driver; false for
-   *         an invalid length or a full TX queue, in which case the caller keeps the
-   *         packet.
+   * @brief 当前调制下的最大载荷长度。
+   *        Largest payload in the current modulation.
    */
-  bool Send(Packet* packet)
-  {
-    if (packet == nullptr || packet->length == 0 || packet->length > MAX_PAYLOAD_SIZE)
-    {
-      return false;
-    }
-
-    if (!PacketFromPool(packet) || !PacketOwnerIs(packet, PacketOwner::USER))
-    {
-      ASSERT(false);
-      return false;
-    }
-
-    SetPacketOwner(packet, PacketOwner::TX_QUEUE);
-    if (tx_pool_.Put(packet) != LibXR::ErrorCode::OK)
-    {
-      SetPacketOwner(packet, PacketOwner::USER);
-      tx_dropped_++;
-      return false;
-    }
-
-    irq_sem_.Post();
-    return true;
-  }
+  uint8_t MaxPayload() const;
 
   /**
-   * @brief 取出一个已收到的包，没有排队的包时立即返回 nullptr。
-   *        Take a received packet; returns nullptr immediately when none is queued.
-   *
-   * @param timeout_ms 保留参数，目前未使用。
-   *                   Reserved, currently unused.
-   * @return 收到的包，处理后须调用 Release() 归还；没有包时为 nullptr。
-   *         The received packet, to be returned with Release() after processing;
-   *         nullptr when none is available.
+   * @brief 提前离开接收进入 FS，让收发切换与调用方的其他工作重叠；之后不发送而调用
+   *        `Poll()` 时重新进入接收。
+   *        Leave receive for FS ahead of a transmission, so that the switch overlaps the
+   *        caller's other work; a `Poll()` without a `Send()` in between listens again.
    */
-  Packet* Receive(uint32_t timeout_ms = 0)
-  {
-    UNUSED(timeout_ms);
-    Packet* packet = nullptr;
-    if (rx_pool_.Get(packet) != LibXR::ErrorCode::OK)
-    {
-      return nullptr;
-    }
-
-    if (packet == nullptr || !PacketFromPool(packet) ||
-        !PacketOwnerIs(packet, PacketOwner::RX_QUEUE))
-    {
-      ASSERT(false);
-      return nullptr;
-    }
-
-    SetPacketOwner(packet, PacketOwner::USER);
-    return packet;
-  }
+  void PrepareSend();
 
   /**
-   * @brief 把 AllocatePacket() 或 Receive() 得到的包归还包池。
-   *        Return a packet obtained from AllocatePacket() or Receive() to the pool.
+   * @brief 发送一包：写入载荷并开始发射就返回，发完由 `Poll()` 转回接收。上一包已经
+   *        发完而 `Poll()` 还没转回接收时，这一包直接从 FS 发出，连续的包之间不进入接收。
+   *        Send one packet: load the payload and start the transmission, then return;
+   *        `Poll()` returns to receive once it is done. When the previous packet is done
+   *        and no `Poll()` has returned to receive yet, this one goes out straight from
+   *        FS, so back-to-back packets do not enter receive in between.
    *
-   * @param packet 待归还的包。
-   *               Packet to return.
+   * @return `OK` 表示已开始发射；上一包还在发射时为 `BUSY`；长度为 0 或超过
+   *         `MaxPayload()` 时为 `ARG_ERR`；SPI 或 BUSY 超时、复位恢复进行中时为
+   *         `FAILED`。
+   *         `OK` once the packet is on air; `BUSY` while the previous one is still on
+   *         air; `ARG_ERR` for size 0 or above `MaxPayload()`; `FAILED` on an SPI or BUSY
+   *         timeout, or while a recovery reset is in progress.
    */
-  void Release(Packet* packet)
-  {
-    if (packet == nullptr)
-    {
-      return;
-    }
+  LibXR::ErrorCode Send(const uint8_t* data, uint8_t size);
 
-    if (!PacketFromPool(packet) || !PacketOwnerIs(packet, PacketOwner::USER))
-    {
-      ASSERT(false);
-      return;
-    }
+  /**
+   * @brief 是否有包正在发送。
+   *        Whether a packet is being sent.
+   */
+  bool Sending() const { return state_ == State::TX; }
 
-    ReturnToPool(packet);
-  }
+  /**
+   * @brief 推进收发：发送中等到 TxDone（或超时）就转回接收；接收中没有待取的包时执行
+   *        停顿恢复。
+   *        Advance the radio: while sending, return to receive on TxDone (or a
+   *        timeout); while receiving with no packet waiting, run the stall recovery.
+   */
+  void Poll();
 
-  /// 芯片 ID Chip ID
-  uint16_t ChipId() const { return chip_id_; }
-  /// 初始化已完成 Initialization finished
-  bool Ready() const { return ready_; }
-  /// 成功接收的包数 Packets received successfully
-  uint32_t RxPackets() const { return rx_packets_; }
-  /// 发送完成的包数 Packets transmitted
-  uint32_t TxPackets() const { return tx_packets_; }
-  /// 因包池为空或接收队列已满而丢弃的接收帧数
-  /// Received frames dropped because the pool was empty or the RX queue was full
-  uint32_t RxDropped() const { return rx_dropped_; }
-  /// 因包池为空或发送队列已满而丢弃的发送数
-  /// Transmissions dropped because the pool was empty or the TX queue was full
-  uint32_t TxDropped() const { return tx_dropped_; }
-  /// 发送失败或超时的包数 Packets that failed or timed out in TX
+  /**
+   * @brief 取一个收到的包。
+   *        Fetch one received packet.
+   *
+   * @param out 至少 `MaxPayload()` 字节。
+   *            At least `MaxPayload()` bytes.
+   * @return 包长；没有包时为 0；坏包（CRC、包头、长度）时为 -1。
+   *         The packet size; 0 when none arrived; -1 for a bad packet (CRC, header,
+   *         length).
+   */
+  int Receive(uint8_t* out);
+
+  /**
+   * @brief 换频点：离开接收，设新频率，回到连续接收；调制、同步字等其余配置不变。之后的
+   *        复位恢复也用这个频点。还没取走的包丢掉。
+   *        Change the frequency: leave receive, set the new frequency and listen again;
+   *        the modulation, sync word and the rest of the configuration stay. Later
+   *        resets of the stall recovery use this frequency too. A packet not fetched yet
+   *        is dropped.
+   *
+   * @return `OK`；发送中为 `BUSY`；SPI 或 BUSY 超时时为 `FAILED`。
+   *         `OK`; `BUSY` while sending; `FAILED` on an SPI or BUSY timeout.
+   */
+  LibXR::ErrorCode Tune(uint32_t frequency_hz);
+
+  /**
+   * @brief 当前信道上的瞬时 RSSI（GetRssiInst），接收中有效。进入接收后约 300 us 内的
+   *        读数不可靠，调用方丢掉。
+   *        Instantaneous RSSI on the current channel (GetRssiInst), valid while
+   *        receiving. Readings within about 300 us of entering receive are not
+   *        reliable; the caller drops them.
+   *
+   * @return 单位 0.5 dBm，例如 -170 为 -85 dBm；不在接收中、SPI 或 BUSY 超时时为 0。
+   *         In units of 0.5 dBm, e.g. -170 for -85 dBm; 0 when not receiving and on an
+   *         SPI or BUSY timeout.
+   */
+  int16_t RssiInstant();
+
+  uint32_t TxPackets() const { return tx_packets_; }  ///< 发出的包 Packets sent
+  /// 发送失败（超时、SPI）的包 Packets whose transmission failed (timeout, SPI)
   uint32_t TxErrors() const { return tx_errors_; }
-  /// 接收队列中的包数；并发访问时为近似快照
-  /// Packets in the RX queue; an approximate snapshot under concurrent access
-  size_t RxQueued() { return CountPackets(PacketOwner::RX_QUEUE); }
-  /// 发送队列中的包数；并发访问时为近似快照
-  /// Packets in the TX queue; an approximate snapshot under concurrent access
-  size_t TxQueued() { return CountPackets(PacketOwner::TX_QUEUE); }
-  /// 包池中的空闲包数；并发访问时为近似快照
-  /// Free packets in the pool; an approximate snapshot under concurrent access
-  size_t FreePackets() { return CountPackets(PacketOwner::FREE); }
-  /// 包池大小 Packet pool size
-  size_t PacketPoolSize() const { return config_.packet_pool_size; }
+  uint32_t RxPackets() const { return rx_packets_; }  ///< 收到的好包 Good packets
+  uint32_t RxErrors() const { return rx_errors_; }    ///< 坏包 Bad packets
+  /// 停顿恢复重新进入接收的次数 Times the stall recovery entered receive again
+  uint32_t Rearms() const { return rearms_; }
+  /// 复位重新配置的次数（不含第一次 `Start()`） Resets, not counting the first `Start()`
+  uint32_t Restarts() const { return restarts_; }
 
  private:
+  static constexpr uint32_t RESET_US = 2000;  // 复位保持 / reset held
+  static constexpr uint32_t WAKE_US = 20000;  // 复位后到能接命令 / reset to ready
+  static constexpr uint32_t STUCK_CHECK_US = 1000;
+  static constexpr uint32_t STUCK_US = 2000;
+
+  /// 射频所处的状态；每个公共成员只看它。 / State of the radio; every public member
+  /// looks at this alone.
   enum class State : uint8_t
   {
-    STANDBY,
-    RX,
-    TX
+    STOPPED,   ///< `Start()` 之前，芯片在复位中 / before `Start()`, held in reset
+    IN_RESET,  ///< 恢复：保持复位 / recovery: holding the reset
+    WAKING,    ///< 恢复：等芯片醒来 / recovery: waiting for the chip to wake
+    RX,        ///< 连续接收 / continuous receive
+    PREPARED,  ///< 在 FS 等 `Send()` / in FS, waiting for `Send()`
+    TX         ///< 发送中，或发完停在 FS / sending, or done and in FS
   };
 
-  enum class PacketOwner : uint8_t
+  enum class TxState : uint8_t
   {
-    FREE,
-    USER,
-    TX_QUEUE,
-    TX_ACTIVE,
-    RX_QUEUE
+    ON_AIR,
+    DONE,
+    TIMED_OUT
   };
 
-  static constexpr uint32_t XTAL_HZ = 52000000UL;
-  static constexpr uint16_t SPI_TIMEOUT_MS = 50;
-  static constexpr uint16_t BUSY_TIMEOUT_MS = 100;
-  static constexpr size_t MAX_TRANSFER_SIZE = 260;
-
-  static constexpr uint8_t CMD_WRITE_REGISTER = 0x18;
-  static constexpr uint8_t CMD_READ_REGISTER = 0x19;
-  static constexpr uint8_t CMD_WRITE_BUFFER = 0x1A;
-  static constexpr uint8_t CMD_READ_BUFFER = 0x1B;
-  static constexpr uint8_t CMD_SET_STANDBY = 0x80;
-  static constexpr uint8_t CMD_SET_TX = 0x83;
-  static constexpr uint8_t CMD_SET_RX = 0x82;
-  static constexpr uint8_t CMD_SET_PACKET_TYPE = 0x8A;
-  static constexpr uint8_t CMD_SET_RF_FREQUENCY = 0x86;
-  static constexpr uint8_t CMD_SET_TX_PARAMS = 0x8E;
-  static constexpr uint8_t CMD_SET_BUFFER_BASE_ADDRESS = 0x8F;
-  static constexpr uint8_t CMD_SET_MODULATION_PARAMS = 0x8B;
-  static constexpr uint8_t CMD_SET_PACKET_PARAMS = 0x8C;
-  static constexpr uint8_t CMD_GET_RX_BUFFER_STATUS = 0x17;
-  static constexpr uint8_t CMD_SET_DIO_IRQ_PARAMS = 0x8D;
-  static constexpr uint8_t CMD_GET_IRQ_STATUS = 0x15;
-  static constexpr uint8_t CMD_CLEAR_IRQ_STATUS = 0x97;
-  static constexpr uint8_t CMD_SET_REGULATOR_MODE = 0x96;
-
-  static constexpr uint16_t REG_CHIP_ID = 0x0944;
-  static constexpr uint16_t REG_XOSC_CAP_BANK_A = 0x0A0E;
-  static constexpr uint16_t REG_XOSC_CAP_BANK_B = 0x0A0F;
-
-  static constexpr uint8_t STANDBY_RC = 0x00;
-  static constexpr uint8_t STANDBY_XOSC = 0x01;
-  static constexpr uint8_t REGULATOR_DCDC = 0x01;
-  static constexpr uint8_t PACKET_TYPE_LORA = 0x01;
-  static constexpr uint8_t LORA_SF8 = 0x80;
-  static constexpr uint8_t LORA_BW0800 = 0x18;
-  static constexpr uint8_t LORA_CR45 = 0x01;
-  static constexpr uint8_t LORA_VARIABLE_LENGTH = 0x00;
-  static constexpr uint8_t LORA_CRC_ON = 0x20;
-  static constexpr uint8_t LORA_IQ_NORMAL = 0x40;
-  static constexpr uint8_t RAMP_02_US = 0x00;
-  static constexpr uint8_t TICK_1000_US = 0x02;
-
-  static constexpr uint16_t IRQ_RADIO_ALL = 0xFFFF;
-  static constexpr uint16_t IRQ_TX_DONE = 0x0001;
-  static constexpr uint16_t IRQ_RX_DONE = 0x0002;
-  static constexpr uint16_t IRQ_HEADER_ERROR = 0x0020;
-  static constexpr uint16_t IRQ_CRC_ERROR = 0x0040;
-  static constexpr uint16_t IRQ_RX_TX_TIMEOUT = 0x4000;
-
-  static uint32_t Elapsed(uint32_t now, uint32_t then)
+  /// 接收停顿恢复用到的时间和标志。 / Times and flags of the receive stall recovery.
+  struct RxWatch
   {
-    return static_cast<uint32_t>(now - then);
+    uint32_t heard_us = 0;       ///< 上一个包或启动的时间 / last packet, or start
+    uint32_t rearmed_us = 0;     ///< 上次进入接收的时间 / last time receive was entered
+    uint32_t checked_us = 0;     ///< 上次查前导码停顿的时间 / last stuck-preamble check
+    bool preamble_seen = false;  ///< 看到了无同步字的前导码 / preamble with no sync word
+    uint32_t preamble_us = 0;    ///< 第一次看到它的时间 / first time it was seen
+    bool arriving = false;       ///< 有包正在到达 / a packet is arriving
+    uint32_t arriving_us = 0;    ///< 第一次看到到达的时间 / first time that was seen
+  };
+
+  bool Resetting() const
+  {
+    return state_ == State::STOPPED || state_ == State::IN_RESET ||
+           state_ == State::WAKING;
   }
 
-  static size_t SanitizeQueueLength(size_t length) { return length == 0 ? 1 : length; }
-
-  static size_t SanitizePoolSize(size_t size)
-  {
-    if (size == 0)
-    {
-      return 1;
-    }
-
-    return std::min(size, PACKET_POOL_CAPACITY);
-  }
-
-  static uint16_t MsToTickSteps(uint16_t ms) { return ms == 0 ? 0 : ms; }
-
-  static void ThreadFunc(SX1281* radio) { radio->WorkerLoop(); }
-
-  void PrimePacketPool()
-  {
-    size_t indices[PACKET_POOL_CAPACITY] = {};
-
-    // 先把全部槽认领出来，把槽下标与包下标绑定一次，再一起放回池里
-    // Claim every slot first, bind each slot index to its packet index once, then
-    // return them all to the pool
-    for (size_t i = 0; i < config_.packet_pool_size; i++)
-    {
-      packet_pool_[i].length = 0;
-      packet_owner_[i].store(PacketOwner::FREE, std::memory_order_relaxed);
-
-      [[maybe_unused]] const auto acquired = free_pool_.Acquire(indices[i]);
-      ASSERT(acquired == LibXR::ErrorCode::OK);
-      free_pool_.At(indices[i]) = &packet_pool_[indices[i]];
-    }
-
-    for (size_t i = 0; i < config_.packet_pool_size; i++)
-    {
-      free_pool_.Release(indices[i]);
-    }
-  }
-
-  bool PacketFromPool(const Packet* packet) const
-  {
-    const auto base = reinterpret_cast<uintptr_t>(&packet_pool_[0]);
-    const auto end = reinterpret_cast<uintptr_t>(&packet_pool_[config_.packet_pool_size]);
-    const auto ptr = reinterpret_cast<uintptr_t>(packet);
-
-    return ptr >= base && ptr < end && ((ptr - base) % sizeof(Packet)) == 0;
-  }
-
-  size_t PacketIndex(const Packet* packet) const
-  {
-    ASSERT(PacketFromPool(packet));
-    const auto base = reinterpret_cast<uintptr_t>(&packet_pool_[0]);
-    const auto ptr = reinterpret_cast<uintptr_t>(packet);
-    return static_cast<size_t>((ptr - base) / sizeof(Packet));
-  }
-
-  bool PacketOwnerIs(const Packet* packet, PacketOwner owner) const
-  {
-    return packet_owner_[PacketIndex(packet)].load(std::memory_order_acquire) == owner;
-  }
-
-  void SetPacketOwner(const Packet* packet, PacketOwner owner)
-  {
-    packet_owner_[PacketIndex(packet)].store(owner, std::memory_order_release);
-  }
-
-  size_t CountPackets(PacketOwner owner) const
-  {
-    size_t count = 0;
-    for (size_t i = 0; i < config_.packet_pool_size; i++)
-    {
-      if (packet_owner_[i].load(std::memory_order_acquire) == owner)
-      {
-        count++;
-      }
-    }
-    return count;
-  }
-
-  void ReturnToPool(Packet* packet)
-  {
-    packet->length = 0;
-    SetPacketOwner(packet, PacketOwner::FREE);
-    // 释放不会失败：在池外（用户、发送队列、接收队列、发送中）的包不占槽，池里始终有空槽
-    // Release cannot fail: packets outside the pool (user, TX queue, RX queue, in TX)
-    // occupy no slot, so a free slot always exists
-    free_pool_.Release(PacketIndex(packet));
-  }
-
-  void ConfigurePins()
-  {
-    nss_->SetConfig({.direction = LibXR::GPIO::Direction::OUTPUT_PUSH_PULL,
-                     .pull = LibXR::GPIO::Pull::UP});
-    nss_->Write(true);
-
-    nreset_->SetConfig({.direction = LibXR::GPIO::Direction::OUTPUT_PUSH_PULL,
-                        .pull = LibXR::GPIO::Pull::NONE});
-    busy_->SetConfig(
-        {.direction = LibXR::GPIO::Direction::INPUT, .pull = LibXR::GPIO::Pull::NONE});
-    dio1_->SetConfig(
-        {.direction = LibXR::GPIO::Direction::INPUT, .pull = LibXR::GPIO::Pull::NONE});
-    dio2_->SetConfig(
-        {.direction = LibXR::GPIO::Direction::INPUT, .pull = LibXR::GPIO::Pull::NONE});
-    dio3_->SetConfig(
-        {.direction = LibXR::GPIO::Direction::INPUT, .pull = LibXR::GPIO::Pull::NONE});
-
-    paen_->SetConfig({.direction = LibXR::GPIO::Direction::OUTPUT_PUSH_PULL,
-                      .pull = LibXR::GPIO::Pull::NONE});
-    lnaen_->SetConfig({.direction = LibXR::GPIO::Direction::OUTPUT_PUSH_PULL,
-                       .pull = LibXR::GPIO::Pull::NONE});
-    dcdcen_->SetConfig({.direction = LibXR::GPIO::Direction::OUTPUT_PUSH_PULL,
-                        .pull = LibXR::GPIO::Pull::NONE});
-
-    paen_->Write(false);
-    lnaen_->Write(false);
-    dcdcen_->Write(true);
-
-    LibXR::SPI::Configuration spi_config;
-    spi_config.clock_polarity = LibXR::SPI::ClockPolarity::LOW;
-    spi_config.clock_phase = LibXR::SPI::ClockPhase::EDGE_1;
-    spi_config.prescaler = spi_->CalcPrescaler(18000000UL, 1000000UL, true);
-    spi_config.double_buffer = false;
-    if (spi_config.prescaler == LibXR::SPI::Prescaler::UNKNOWN)
-    {
-      spi_config.prescaler = LibXR::SPI::Prescaler::DIV_4;
-    }
-    spi_->SetConfig(spi_config);
-  }
-
-  void ConfigureDio1Interrupt()
-  {
-    dio1_->DisableInterrupt();
-    dio1_->SetConfig({.direction = LibXR::GPIO::Direction::RISING_INTERRUPT,
-                      .pull = LibXR::GPIO::Pull::NONE});
-
-    auto irq_cb = LibXR::GPIO::Callback::Create(
-        [](bool in_isr, SX1281* radio) { radio->irq_sem_.PostFromCallback(in_isr); },
-        this);
-
-    dio1_->RegisterCallback(irq_cb);
-    dio1_->EnableInterrupt();
-  }
-
-  void WorkerLoop()
-  {
-    while (true)
-    {
-      if (irq_sem_.Wait(GetWorkerWaitMs()) == LibXR::ErrorCode::OK)
-      {
-        HandleRadioIrq();
-      }
-
-      PeriodicWork();
-    }
-  }
-
-  uint32_t GetWorkerWaitMs()
-  {
-    ASSERT(ready_);
-
-    if (state_ != State::TX && CountPackets(PacketOwner::TX_QUEUE) > 0)
-    {
-      return 0;
-    }
-
-    if (!config_.auto_tx_enabled || state_ != State::RX)
-    {
-      return UINT32_MAX;
-    }
-
-    const uint32_t now = LibXR::Thread::GetTime();
-    const uint32_t elapsed = Elapsed(now, last_auto_tx_ms_);
-    if (elapsed >= config_.auto_tx_period_ms)
-    {
-      return 0;
-    }
-
-    return config_.auto_tx_period_ms - elapsed;
-  }
-
-  void PeriodicWork()
-  {
-    const uint32_t now = LibXR::Thread::GetTime();
-
-    ASSERT(ready_);
-
-    TryStartQueuedTx();
-
-    if (config_.auto_tx_enabled && state_ == State::RX &&
-        Elapsed(now, last_auto_tx_ms_) >= config_.auto_tx_period_ms)
-    {
-      static constexpr uint8_t PING[] = {'a', 's', 'h', 'i', 'n', 'i', 'n', 'g'};
-      Packet* packet = AllocatePacket();
-      if (packet != nullptr)
-      {
-        packet->length = sizeof(PING);
-        std::memcpy(packet->data, PING, sizeof(PING));
-        if (Send(packet))
-        {
-          last_auto_tx_ms_ = now;
-        }
-        else
-        {
-          Release(packet);
-        }
-      }
-      else
-      {
-        tx_dropped_++;
-      }
-    }
-  }
-
-  void HandleRadioIrq()
-  {
-    ASSERT(ready_);
-
-    const uint16_t irq = GetIrqStatus();
-    if (irq == 0)
-    {
-      return;
-    }
-
-    ClearIrqStatus(IRQ_RADIO_ALL);
-
-    if ((irq & (IRQ_CRC_ERROR | IRQ_HEADER_ERROR)) != 0)
-    {
-      rx_errors_++;
-      ContinueRxOrTx();
-    }
-    else if ((irq & IRQ_RX_DONE) != 0)
-    {
-      if (ReadAndQueuePayload())
-      {
-        rx_packets_++;
-      }
-      else
-      {
-        rx_errors_++;
-      }
-      ContinueRxOrTx();
-    }
-    else if ((irq & IRQ_TX_DONE) != 0)
-    {
-      tx_packets_++;
-      ReleaseActiveTxPacket();
-      ContinueRxOrTx();
-    }
-    else if ((irq & IRQ_RX_TX_TIMEOUT) != 0)
-    {
-      if (state_ == State::TX)
-      {
-        tx_errors_++;
-        ReleaseActiveTxPacket();
-      }
-      ContinueRxOrTx();
-    }
-  }
-
-  bool TryStartQueuedTx()
-  {
-    ASSERT(ready_);
-
-    if (state_ == State::TX)
-    {
-      return false;
-    }
-
-    ASSERT(active_tx_packet_ == nullptr);
-
-    Packet* packet = nullptr;
-    if (tx_pool_.Get(packet) != LibXR::ErrorCode::OK)
-    {
-      return false;
-    }
-
-    ASSERT(packet != nullptr);
-    ASSERT(PacketFromPool(packet));
-    ASSERT(PacketOwnerIs(packet, PacketOwner::TX_QUEUE));
-
-    active_tx_packet_ = packet;
-    SetPacketOwner(active_tx_packet_, PacketOwner::TX_ACTIVE);
-    if (!StartTx(*packet))
-    {
-      ReleaseActiveTxPacket();
-      tx_errors_++;
-      [[maybe_unused]] const bool rx_ok = EnterRx();
-      ASSERT(rx_ok);
-      ready_ = true;
-      return true;
-    }
-
-    return true;
-  }
-
-  void ContinueRxOrTx()
-  {
-    state_ = State::STANDBY;
-    if (!TryStartQueuedTx())
-    {
-      [[maybe_unused]] const bool rx_ok = EnterRx();
-      ASSERT(rx_ok);
-      ready_ = true;
-    }
-  }
-
-  bool StartTx(const Packet& packet)
-  {
-    if (packet.length == 0 || packet.length > MAX_PAYLOAD_SIZE)
-    {
-      return false;
-    }
-
-    SetRfSwitch(State::TX);
-    if (!SetPacketParams(packet.length))
-    {
-      return false;
-    }
-    if (!SetDioIrqParams(IRQ_TX_DONE | IRQ_RX_TX_TIMEOUT, IRQ_TX_DONE | IRQ_RX_TX_TIMEOUT,
-                         0, 0))
-    {
-      return false;
-    }
-    if (!WriteBuffer(0, packet.data, packet.length))
-    {
-      return false;
-    }
-    if (!SetTx(config_.tx_timeout_ms))
-    {
-      return false;
-    }
-
-    state_ = State::TX;
-    return true;
-  }
-
-  void Reset()
-  {
-    nss_->Write(true);
-    nreset_->Write(true);
-    LibXR::Thread::Sleep(20);
-    nreset_->Write(false);
-    LibXR::Thread::Sleep(50);
-    nreset_->Write(true);
-    LibXR::Thread::Sleep(20);
-    WaitOnBusy(BUSY_TIMEOUT_MS);
-  }
-
-  bool WaitOnBusy(uint16_t timeout_ms)
-  {
-    const uint32_t start = LibXR::Thread::GetTime();
-    while (busy_->Read())
-    {
-      if (Elapsed(LibXR::Thread::GetTime(), start) >= timeout_ms)
-      {
-        return false;
-      }
-      LibXR::Thread::Sleep(1);
-    }
-    return true;
-  }
-
-  void Select() { nss_->Write(false); }
-  void Deselect() { nss_->Write(true); }
-
-  bool Exchange(size_t size)
-  {
-    if (size == 0 || size > MAX_TRANSFER_SIZE)
-    {
-      return false;
-    }
-    std::memset(rx_, 0, size);
-    Select();
-    const auto ans = spi_->ReadAndWrite(LibXR::RawData(rx_, size),
-                                        LibXR::ConstRawData(tx_, size), spi_op_);
-    Deselect();
-    return ans == LibXR::ErrorCode::OK;
-  }
-
-  bool WriteCommand(uint8_t command, const uint8_t* buffer, uint16_t size)
-  {
-    if (!WaitOnBusy(BUSY_TIMEOUT_MS) || static_cast<size_t>(size) + 1 > MAX_TRANSFER_SIZE)
-    {
-      return false;
-    }
-
-    tx_[0] = command;
-    if (size > 0)
-    {
-      std::memcpy(&tx_[1], buffer, size);
-    }
-
-    if (!Exchange(static_cast<size_t>(size) + 1))
-    {
-      return false;
-    }
-    return WaitOnBusy(BUSY_TIMEOUT_MS);
-  }
-
-  bool ReadCommand(uint8_t command, uint8_t* buffer, uint16_t size)
-  {
-    if (buffer == nullptr || !WaitOnBusy(BUSY_TIMEOUT_MS) ||
-        static_cast<size_t>(size) + 2 > MAX_TRANSFER_SIZE)
-    {
-      return false;
-    }
-
-    tx_[0] = command;
-    tx_[1] = 0x00;
-    std::memset(&tx_[2], 0, size);
-
-    if (!Exchange(static_cast<size_t>(size) + 2))
-    {
-      return false;
-    }
-    std::memcpy(buffer, &rx_[2], size);
-    return WaitOnBusy(BUSY_TIMEOUT_MS);
-  }
-
-  bool WriteRegisters(uint16_t address, const uint8_t* buffer, uint16_t size)
-  {
-    if (buffer == nullptr || !WaitOnBusy(BUSY_TIMEOUT_MS) ||
-        static_cast<size_t>(size) + 3 > MAX_TRANSFER_SIZE)
-    {
-      return false;
-    }
-
-    tx_[0] = CMD_WRITE_REGISTER;
-    tx_[1] = static_cast<uint8_t>(address >> 8);
-    tx_[2] = static_cast<uint8_t>(address);
-    std::memcpy(&tx_[3], buffer, size);
-
-    if (!Exchange(static_cast<size_t>(size) + 3))
-    {
-      return false;
-    }
-    return WaitOnBusy(BUSY_TIMEOUT_MS);
-  }
-
-  bool ReadRegisters(uint16_t address, uint8_t* buffer, uint16_t size)
-  {
-    if (buffer == nullptr || !WaitOnBusy(BUSY_TIMEOUT_MS) ||
-        static_cast<size_t>(size) + 4 > MAX_TRANSFER_SIZE)
-    {
-      return false;
-    }
-
-    tx_[0] = CMD_READ_REGISTER;
-    tx_[1] = static_cast<uint8_t>(address >> 8);
-    tx_[2] = static_cast<uint8_t>(address);
-    tx_[3] = 0x00;
-    std::memset(&tx_[4], 0, size);
-
-    if (!Exchange(static_cast<size_t>(size) + 4))
-    {
-      return false;
-    }
-    std::memcpy(buffer, &rx_[4], size);
-    return WaitOnBusy(BUSY_TIMEOUT_MS);
-  }
-
-  bool WriteRegister(uint16_t address, uint8_t value)
-  {
-    return WriteRegisters(address, &value, 1);
-  }
-
-  bool WriteBuffer(uint8_t offset, const uint8_t* buffer, uint8_t size)
-  {
-    if (buffer == nullptr || !WaitOnBusy(BUSY_TIMEOUT_MS) ||
-        static_cast<size_t>(size) + 2 > MAX_TRANSFER_SIZE)
-    {
-      return false;
-    }
-
-    tx_[0] = CMD_WRITE_BUFFER;
-    tx_[1] = offset;
-    std::memcpy(&tx_[2], buffer, size);
-
-    if (!Exchange(static_cast<size_t>(size) + 2))
-    {
-      return false;
-    }
-    return WaitOnBusy(BUSY_TIMEOUT_MS);
-  }
-
-  bool ReadBuffer(uint8_t offset, uint8_t* buffer, uint8_t size)
-  {
-    if (buffer == nullptr || !WaitOnBusy(BUSY_TIMEOUT_MS) ||
-        static_cast<size_t>(size) + 3 > MAX_TRANSFER_SIZE)
-    {
-      return false;
-    }
-
-    tx_[0] = CMD_READ_BUFFER;
-    tx_[1] = offset;
-    tx_[2] = 0x00;
-    std::memset(&tx_[3], 0, size);
-
-    if (!Exchange(static_cast<size_t>(size) + 3))
-    {
-      return false;
-    }
-    std::memcpy(buffer, &rx_[3], size);
-    return WaitOnBusy(BUSY_TIMEOUT_MS);
-  }
-
-  bool SetStandby(uint8_t mode) { return WriteCommand(CMD_SET_STANDBY, &mode, 1); }
-
-  bool SetPacketType(uint8_t packet_type)
-  {
-    packet_type_ = packet_type;
-    return WriteCommand(CMD_SET_PACKET_TYPE, &packet_type, 1);
-  }
-
-  bool SetModulationParams()
-  {
-    const uint8_t params[3] = {LORA_SF8, LORA_BW0800, LORA_CR45};
-    return WriteCommand(CMD_SET_MODULATION_PARAMS, params, sizeof(params));
-  }
-
-  bool SetPacketParams(uint8_t payload_length)
-  {
-    const uint8_t params[7] = {
-        12, LORA_VARIABLE_LENGTH, payload_length, LORA_CRC_ON, LORA_IQ_NORMAL, 0, 0};
-    return WriteCommand(CMD_SET_PACKET_PARAMS, params, sizeof(params));
-  }
-
-  bool SetRfFrequency(uint32_t frequency_hz)
-  {
-    const uint32_t reg =
-        static_cast<uint32_t>((static_cast<uint64_t>(frequency_hz) << 18) / XTAL_HZ);
-    const uint8_t params[3] = {static_cast<uint8_t>(reg >> 16),
-                               static_cast<uint8_t>(reg >> 8), static_cast<uint8_t>(reg)};
-    return WriteCommand(CMD_SET_RF_FREQUENCY, params, sizeof(params));
-  }
-
-  bool SetTxParams(int8_t power_dbm, uint8_t ramp_time)
-  {
-    power_dbm = std::clamp<int8_t>(power_dbm, -18, 13);
-    const uint8_t params[2] = {static_cast<uint8_t>(power_dbm + 18), ramp_time};
-    return WriteCommand(CMD_SET_TX_PARAMS, params, sizeof(params));
-  }
-
-  bool SetBufferBaseAddress(uint8_t tx_base, uint8_t rx_base)
-  {
-    const uint8_t params[2] = {tx_base, rx_base};
-    return WriteCommand(CMD_SET_BUFFER_BASE_ADDRESS, params, sizeof(params));
-  }
-
-  bool SetDioIrqParams(uint16_t irq_mask, uint16_t dio1_mask, uint16_t dio2_mask,
-                       uint16_t dio3_mask)
-  {
-    const uint8_t params[8] = {
-        static_cast<uint8_t>(irq_mask >> 8),  static_cast<uint8_t>(irq_mask),
-        static_cast<uint8_t>(dio1_mask >> 8), static_cast<uint8_t>(dio1_mask),
-        static_cast<uint8_t>(dio2_mask >> 8), static_cast<uint8_t>(dio2_mask),
-        static_cast<uint8_t>(dio3_mask >> 8), static_cast<uint8_t>(dio3_mask)};
-    return WriteCommand(CMD_SET_DIO_IRQ_PARAMS, params, sizeof(params));
-  }
-
-  bool SetTx(uint16_t timeout_ms)
-  {
-    const uint16_t steps = MsToTickSteps(timeout_ms);
-    const uint8_t params[3] = {TICK_1000_US, static_cast<uint8_t>(steps >> 8),
-                               static_cast<uint8_t>(steps)};
-    return WriteCommand(CMD_SET_TX, params, sizeof(params));
-  }
-
-  bool SetRx(uint16_t timeout_ms)
-  {
-    const uint16_t steps = MsToTickSteps(timeout_ms);
-    const uint8_t params[3] = {TICK_1000_US, static_cast<uint8_t>(steps >> 8),
-                               static_cast<uint8_t>(steps)};
-    return WriteCommand(CMD_SET_RX, params, sizeof(params));
-  }
-
-  bool SetXoscCap(uint8_t cap_value)
-  {
-    cap_value &= 0x1F;
-    return SetStandby(STANDBY_XOSC) && WriteRegister(REG_XOSC_CAP_BANK_A, cap_value) &&
-           WriteRegister(REG_XOSC_CAP_BANK_B, cap_value);
-  }
-
-  uint16_t GetIrqStatus()
-  {
-    uint8_t status[2] = {};
-    if (!ReadCommand(CMD_GET_IRQ_STATUS, status, sizeof(status)))
-    {
-      return 0;
-    }
-    return static_cast<uint16_t>((static_cast<uint16_t>(status[0]) << 8) | status[1]);
-  }
-
-  bool ClearIrqStatus(uint16_t irq)
-  {
-    const uint8_t params[2] = {static_cast<uint8_t>(irq >> 8), static_cast<uint8_t>(irq)};
-    return WriteCommand(CMD_CLEAR_IRQ_STATUS, params, sizeof(params));
-  }
-
-  bool EnterRx()
-  {
-    SetRfSwitch(State::RX);
-    if (!SetPacketParams(MAX_PAYLOAD_SIZE))
-    {
-      return false;
-    }
-    if (!SetDioIrqParams(
-            IRQ_RX_DONE | IRQ_RX_TX_TIMEOUT | IRQ_CRC_ERROR | IRQ_HEADER_ERROR,
-            IRQ_RX_DONE | IRQ_RX_TX_TIMEOUT | IRQ_CRC_ERROR | IRQ_HEADER_ERROR, 0, 0))
-    {
-      return false;
-    }
-    if (!SetRx(config_.rx_timeout_ms))
-    {
-      return false;
-    }
-    state_ = State::RX;
-    return true;
-  }
-
-  bool ReadAndQueuePayload()
-  {
-    uint8_t size = 0;
-    uint8_t offset = 0;
-    if (!ReadPayloadStatus(size, offset))
-    {
-      return false;
-    }
-
-    if (size == 0)
-    {
-      return true;
-    }
-
-    Packet* packet = AllocatePacket();
-    if (packet == nullptr)
-    {
-      rx_dropped_++;
-      return true;
-    }
-
-    if (!ReadPayload(*packet, offset, size))
-    {
-      Release(packet);
-      return false;
-    }
-
-    SetPacketOwner(packet, PacketOwner::RX_QUEUE);
-    if (rx_pool_.Put(packet) != LibXR::ErrorCode::OK)
-    {
-      SetPacketOwner(packet, PacketOwner::USER);
-      rx_dropped_++;
-      ReturnToPool(packet);
-    }
-
-    return true;
-  }
-
-  bool ReadPayloadStatus(uint8_t& size, uint8_t& offset)
-  {
-    uint8_t status[2] = {};
-    if (!ReadCommand(CMD_GET_RX_BUFFER_STATUS, status, sizeof(status)))
-    {
-      return false;
-    }
-
-    size = status[0];
-    offset = status[1];
-    if (size > MAX_PAYLOAD_SIZE)
-    {
-      size = MAX_PAYLOAD_SIZE;
-    }
-
-    return true;
-  }
-
-  bool ReadPayload(Packet& packet, uint8_t offset, uint8_t size)
-  {
-    packet = {};
-
-    if (size == 0)
-    {
-      return true;
-    }
-
-    if (!ReadBuffer(offset, packet.data, size))
-    {
-      return false;
-    }
-
-    packet.length = size;
-    return true;
-  }
-
-  void ReleaseActiveTxPacket()
-  {
-    if (active_tx_packet_ == nullptr)
-    {
-      return;
-    }
-
-    ASSERT(PacketOwnerIs(active_tx_packet_, PacketOwner::TX_ACTIVE));
-    ReturnToPool(active_tx_packet_);
-    active_tx_packet_ = nullptr;
-  }
-
-  void SetRfSwitch(State mode)
-  {
-    switch (mode)
-    {
-      case State::TX:
-        paen_->Write(true);
-        lnaen_->Write(false);
-        break;
-      case State::RX:
-        paen_->Write(false);
-        lnaen_->Write(true);
-        break;
-      case State::STANDBY:
-      default:
-        paen_->Write(false);
-        lnaen_->Write(false);
-        break;
-    }
-  }
-
-  LibXR::SPI* spi_;
-  LibXR::GPIO* nss_;
-  LibXR::GPIO* dio1_;
-  LibXR::GPIO* dio2_;
-  LibXR::GPIO* dio3_;
-  LibXR::GPIO* paen_;
-  LibXR::GPIO* lnaen_;
+  const SX1281Modem& Modem() const;
+  void ConfigurePins();
+
+  // 启动和复位 / Start-up and reset
+  bool Restart();
+  void HoldReset();
+  bool Configure();
+  bool WriteSyncWord();
+  bool SetPacketParams(uint8_t payload_size);
+
+  // 收发切换 / Switching between transmit and receive
+  void EnterFs();
+  void EnterRx();
+  TxState CheckTx();
+  void EndTx(TxState state);
+  void FinishSend();
+  void SetRfSwitch(bool transmit);
+
+  // 接收停顿恢复 / Receive stall recovery
+  void Recover();
+  bool PacketArriving(uint32_t now, uint16_t irq);
+  bool PreambleStuck(uint32_t now, uint16_t irq);
+  bool PacketStatusBad();
+
+  SX1281Bus bus_;
+  LibXR::GPIO& nreset_;
+  LibXR::GPIO& dio1_;
+  LibXR::GPIO& txen_;
+  LibXR::GPIO& rxen_;
   LibXR::GPIO* dcdcen_;
-  LibXR::GPIO* busy_;
-  LibXR::GPIO* nreset_;
-
-  LibXR::Semaphore spi_sem_;
-  LibXR::Semaphore irq_sem_;
-  LibXR::SPI::OperationRW spi_op_;
-  Packet packet_pool_[PACKET_POOL_CAPACITY] = {};
-  std::atomic<PacketOwner> packet_owner_[PACKET_POOL_CAPACITY] = {};
-  LibXR::SlotPool<Packet*> free_pool_;
-  LibXR::SlotPool<Packet*> tx_pool_;
-  LibXR::SlotPool<Packet*> rx_pool_;
-  LibXR::Thread irq_thread_;
   Config config_;
 
-  uint8_t tx_[MAX_TRANSFER_SIZE] = {};
-  uint8_t rx_[MAX_TRANSFER_SIZE] = {};
+  State state_ = State::STOPPED;
+  uint32_t reset_us_ = 0;       // 当前复位阶段开始的时间 / start of the reset phase
+  uint32_t tx_started_us_ = 0;  // 这一包开始发送的时间 / start of this transmission
+  RxWatch watch_;
 
-  bool ready_ = false;
-  uint8_t packet_type_ = PACKET_TYPE_LORA;
-  State state_ = State::STANDBY;
-  Packet* active_tx_packet_ = nullptr;
-  uint16_t chip_id_ = 0;
-  uint32_t last_auto_tx_ms_ = 0;
-  uint32_t rx_packets_ = 0;
   uint32_t tx_packets_ = 0;
-  uint32_t rx_errors_ = 0;
   uint32_t tx_errors_ = 0;
-  uint32_t rx_dropped_ = 0;
-  uint32_t tx_dropped_ = 0;
+  uint32_t rx_packets_ = 0;
+  uint32_t rx_errors_ = 0;
+  uint32_t rearms_ = 0;
+  uint32_t restarts_ = 0;
 };
+
+#include "sx1281_impl.hpp"
